@@ -10,16 +10,13 @@ import type {
 
 import type { UsageLimit, UsageSnapshot } from '../types'
 
-const PANE = 'usage-rail'
-const TITLE = '사용량'
+// The pane session-rail opens; this mod adds its card to it.
+const RAIL = 'session-rail'
 const TICK_MS = 30_000
-// Prompts the person typed, here or through Remote Control.
-const PERSONAL_ORIGINS: readonly string[] = ['composer', 'bridge']
 
 const snapshot = atom({ plugin: 'usage-rail', key: 'snapshot' } as const, null)
 const now = atom({ plugin: 'usage-rail', key: 'now' } as const, 0)
-const isDismissed = atom({ plugin: 'usage-rail', key: 'isDismissed' } as const, false)
-const isWarned = atom({ plugin: 'usage-rail', key: 'isWarned' } as const, false)
+const isCollapsed = atom({ plugin: 'usage-rail', key: 'isCollapsed' } as const, false)
 
 // The windows the settings' Usage screen lists, in its order; any other kind
 // the API reports is drawn after them under its own name.
@@ -31,6 +28,14 @@ const LABELS: Record<string, string> = {
   spend_limit: '지출 한도',
 }
 const ORDER = Object.keys(LABELS)
+// The names the folded card's one line uses.
+const SHORT: Record<string, string> = {
+  five_hour: '5시간',
+  seven_day: '주간',
+  seven_day_opus: 'Opus',
+  seven_day_sonnet: 'Sonnet',
+  spend_limit: '지출',
+}
 
 type Figures = {
   rateLimits: readonly SessionRateLimit[]
@@ -108,26 +113,34 @@ function ago(ms: number): string {
   return `${Math.floor(minutes / 60)}시간 전`
 }
 
-// The open session.start makes is unasked, and an unasked pane waits undrawn
-// below 144 columns, which an app's transcript seldom reaches; one made from
-// the person's own prompt is placed at any width.
-async function showPane($: EngineInterface) {
-  if (await read($, isDismissed)) return
-  const pane = (await $.ui.panes()).find(one => one.id === PANE)
-  if (pane?.isPlaced === true) return
+function label(kind: string): string {
+  return LABELS[kind] ?? kind
+}
 
-  const opened = await $.ui.open({ id: PANE, title: TITLE })
-  if (opened.isPlaced || (await read($, isWarned))) return
+// What /usage-rail answers, for a surface with no pane.
+function summary(shot: UsageSnapshot | null, at: number): string {
+  if (shot === null) return '아직 측정된 사용량이 없습니다.'
 
-  await update($, isWarned, () => true)
-  $.ui.toast(`사용량 패널을 열지 못했습니다: ${opened.reason}`)
+  const lines = shot.limits.map(limit => {
+    const reset = untilReset(limit.resetsAt, at)
+    return `${label(limit.kind)}: ${Math.round(limit.percentUsed)}%${reset === undefined ? '' : ` · ${reset}`}`
+  })
+  if (lines.length === 0) lines.push('플랜 한도: 아직 정보가 없습니다 (첫 응답 이후, 구독 계정에서만 제공)')
+  if (shot.contextPercent !== undefined) {
+    lines.push(
+      `컨텍스트: ${shot.contextPercent}% (${tokens(shot.contextTokens ?? 0)} / ${tokens(shot.contextWindow)} 토큰)`,
+    )
+  }
+  if (shot.costUsd !== undefined) lines.push(`세션 비용: $${shot.costUsd.toFixed(2)}`)
+
+  return lines.join('\n')
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-rail',
-      description: '세션 레일에 사용량(5시간·주간 한도, 컨텍스트, 비용) 패널을 엽니다',
+      description: '사용량(5시간·주간 한도, 컨텍스트, 비용)을 새로 불러와 보여줍니다',
     })
 
     if (e.isInteractive) {
@@ -135,7 +148,6 @@ export const register: Register = on => {
       $.clock.every(TICK_MS, () => {
         void $.clock.now().then(at => update($, now, () => at))
       })
-      void $.ui.open({ id: PANE, title: TITLE })
     }
 
     return next(e)
@@ -143,29 +155,9 @@ export const register: Register = on => {
 
   on('command.run', { command: 'usage-rail' }, async $ => {
     await refresh($).catch(() => undefined)
-    await update($, isDismissed, () => false)
-    const opened = await $.ui.open({ id: PANE, title: TITLE })
 
-    return {
-      text: opened.isPlaced
-        ? '사용량 패널을 열었습니다.'
-        : `사용량 패널을 열지 못했습니다: ${opened.reason}`,
-    }
+    return { text: summary(await read($, snapshot), await $.clock.now()) }
   })
-
-  on('prompt.submit', async ($, e, next) => {
-    if (e.isMeta !== true && PERSONAL_ORIGINS.includes(e.origin.kind)) {
-      await showPane($).catch(() => undefined)
-    }
-
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
-  on('ui.close', { id: PANE }, async ($, e, next) => {
-    if (e.origin.kind === 'person') await update($, isDismissed, () => true)
-
-    return next(e)
-  }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
     await refresh($, e)
@@ -173,19 +165,25 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  // The card goes above whatever the other mods add, so it leads the pane.
+  on('ui.render', { component: 'Pane', requestId: RAIL }, async ($, e, next) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    const below = await next(e)
     const shot = await read($, snapshot)
+    const isFolded = await read($, isCollapsed)
     const at = Math.max(await read($, now), shot?.measuredAt ?? 0)
-    const width = Math.max(10, Math.min(36, e.props.bodyColumns - 7))
+    const width = Math.max(10, e.props.bodyColumns - 4)
 
-    const meter = (percent: number) => (
-      <Box flexDirection="row" gap={1}>
+    const row = (name: string, value: string, percent: number) => (
+      <Box flexDirection="column">
+        <Box flexDirection="row" justifyContent="space-between" gap={1}>
+          <Text wrap="truncate-end">{name}</Text>
+          <Text weight="semibold" tabular color={tone(percent)}>
+            {value}
+          </Text>
+        </Box>
         <Text mono color={tone(percent)}>
           {bar(percent, width)}
-        </Text>
-        <Text weight="semibold" tabular>
-          {`${Math.round(percent)}%`}
         </Text>
       </Box>
     )
@@ -198,8 +196,7 @@ export const register: Register = on => {
       ) : (
         shot.limits.map(limit => (
           <Box flexDirection="column">
-            <Text weight="semibold">{LABELS[limit.kind] ?? limit.kind}</Text>
-            {meter(limit.percentUsed)}
+            {row(label(limit.kind), `${Math.round(limit.percentUsed)}%`, limit.percentUsed)}
             {untilReset(limit.resetsAt, at) !== undefined && (
               <Text dimColor>{untilReset(limit.resetsAt, at)}</Text>
             )}
@@ -207,42 +204,56 @@ export const register: Register = on => {
         ))
       )
 
-    const context =
-      shot?.contextPercent === undefined ? (
-        <Text dimColor>첫 응답 이후에 표시됩니다.</Text>
-      ) : (
-        <Box flexDirection="column">
-          {meter(shot.contextPercent)}
-          <Text dimColor>
-            {`${tokens(shot.contextTokens ?? 0)} / ${tokens(shot.contextWindow)} 토큰`}
-          </Text>
-        </Box>
-      )
+    const folded = shot?.limits
+      .slice(0, 2)
+      .map(limit => `${SHORT[limit.kind] ?? limit.kind} ${Math.round(limit.percentUsed)}%`)
+      .join(' · ')
 
-    return (
-      <Box flexDirection="column" gap={1}>
-        <Text size="heading" weight="bold">
-          플랜 사용 한도
-        </Text>
-        <Box flexDirection="column" gap={1}>
-          {limits}
+    const card = (
+      <Box key="usage-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>
+        <Box flexDirection="row" justifyContent="space-between" gap={1}>
+          <Button key="usage-fold" plain onPress={() => update($, isCollapsed, isOn => !isOn)}>
+            <Text weight="semibold">사용량</Text>
+            <Text dimColor>{isFolded ? ' ›' : ' ∨'}</Text>
+          </Button>
+          {isFolded && folded !== undefined && folded !== '' && <Text dimColor tabular>{folded}</Text>}
         </Box>
-        <Box flexDirection="column">
-          <Text weight="semibold">컨텍스트</Text>
-          {context}
-        </Box>
-        {shot?.costUsd !== undefined && (
-          <Box flexDirection="row" gap={1}>
-            <Text weight="semibold">세션 비용</Text>
+        {!isFolded && limits}
+        {!isFolded &&
+          shot?.contextPercent !== undefined &&
+          row(
+            '컨텍스트',
+            `${tokens(shot.contextTokens ?? 0)} / ${tokens(shot.contextWindow)}`,
+            shot.contextPercent,
+          )}
+        {!isFolded && shot?.costUsd !== undefined && (
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Text>세션 비용</Text>
             <Text tabular>{`$${shot.costUsd.toFixed(2)}`}</Text>
           </Box>
         )}
-        <Box flexDirection="row" gap={1} alignItems="center">
-          <Text dimColor>
-            {shot === null ? '측정 전' : `갱신 ${ago(at - shot.measuredAt)}`}
-          </Text>
-          <Button key="refresh" label="새로고침" dimColor onPress={() => refresh($)} />
-        </Box>
+        {!isFolded && (
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Text dimColor>{shot === null ? '측정 전' : `갱신 ${ago(at - shot.measuredAt)}`}</Text>
+            <Button
+              key="usage-refresh"
+              plain
+              dimColor
+              label="새로 불러오기"
+              onPress={async () => {
+                await refresh($)
+                $.ui.toast('사용량을 새로 불러왔습니다')
+              }}
+            />
+          </Box>
+        )}
+      </Box>
+    )
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {card}
+        {below}
       </Box>
     )
   })
