@@ -26,6 +26,7 @@ function engine(on: On, stored: Record<string, unknown> = {}) {
   let tasks = 0
   on('session.id', () => ({ value: 'session-1' }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.panes', () => ({ value: [] }))
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('prompt.fill', ($, e) => {
     seen.filled = e.text

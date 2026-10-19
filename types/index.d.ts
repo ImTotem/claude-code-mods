@@ -33,6 +33,14 @@ export type TodoStack = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'todo-stack': { stack: TodoStack; hideDone: boolean; isConfirmingClear: boolean }
+    'todo-stack': {
+      stack: TodoStack
+      hideDone: boolean
+      isConfirmingClear: boolean
+      // The person closed the pane by hand; it stays closed until /todo-stack.
+      isDismissed: boolean
+      // The pane could not be placed and the person was told once.
+      isWarned: boolean
+    }
   }
 }
