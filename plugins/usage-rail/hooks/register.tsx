@@ -10,11 +10,18 @@ const RAIL_TITLE = '세션'
 // The endpoint the Usage screen reads, called with the session's own
 // credential through $.session.authorize; never more than once a minute.
 const USAGE_PATH = '/api/oauth/usage'
-const FETCH_GAP_MS = 60_000
+// The endpoint limits how often it is read: five minutes after an answer,
+// as Claude Code's own Usage screen waits, longer after a refusal.
+const FETCH_GAP_MS = 5 * 60_000
+const RATE_LIMITED_GAP_MS = 10 * 60_000
+const REFUSED_GAP_MS = 30 * 60_000
+const FAILED_GAP_MS = 60_000
 const READ_TIMEOUT_MS = 15_000
 const POLL_MS = 5 * 60_000
 const TICK_MS = 30_000
 const BAR_COLOR = '#3d7eea'
+const TRACK_COLOR = 'rgba(128,128,128,0.3)'
+const BAR_HEIGHT = 8
 
 // The windows the app's usage card shows, in its order and words.
 const LABELS: Record<string, string> = {
@@ -155,26 +162,45 @@ function withTimeout<T>($: EngineInterface, work: Promise<T>): Promise<T> {
   return Promise.race([work, timeout])
 }
 
-// The minute between reads counts from the last read that answered, so a
-// failing read is tried again at the next turn, prompt or open.
-let lastReadAt = 0
+function gapAfter(isAnswered: boolean, status: number | null): number {
+  if (isAnswered) return FETCH_GAP_MS
+  if (status === 429) return RATE_LIMITED_GAP_MS
+  if (status !== null && status >= 400 && status < 500) return REFUSED_GAP_MS
+
+  return FAILED_GAP_MS
+}
+
+let nextReadAt = 0
 let reading: Promise<void> | undefined
 
 async function readNow($: EngineInterface, limits: readonly SessionRateLimit[] | undefined, force: boolean) {
   const at = await $.clock.now()
   await update($, now, () => at)
-  if (!force && at - lastReadAt < FETCH_GAP_MS) return
+
+  const previous = await read($, snapshot)
+  const headers = fromHeaders(limits ?? (await $.session.usage()).rateLimits, at)
+  if (!force && at < nextReadAt) {
+    // Between reads of the endpoint, a fresher header reading still lands.
+    if (previous !== null && headers.windows.length > 0 && previous.measuredAt < at) {
+      await update($, snapshot, () => ({ ...previous, windows: headers.windows, measuredAt: at }))
+    }
+    return
+  }
 
   const fetched = await withTimeout($, readEndpoint($, at)).catch(async (error: unknown) => {
     await record($, { at, status: null, error: messageOf(error) })
     return undefined
   })
-  // A refusal (4xx) will not change on the next turn: it waits its minute too.
   const outcome = await read($, lastFetch)
-  const isRefused = outcome?.at === at && outcome.status !== null && outcome.status >= 400 && outcome.status < 500
-  if (fetched !== undefined || isRefused) lastReadAt = at
+  nextReadAt = at + gapAfter(fetched !== undefined, outcome?.at === at ? outcome.status : null)
 
-  const shot = fetched ?? fromHeaders(limits ?? (await $.session.usage()).rateLimits, at)
+  // Where the endpoint did not answer, the headers' windows stand in and the
+  // credit last read stays.
+  const shot: UsageSnapshot = fetched ?? {
+    windows: headers.windows.length > 0 ? headers.windows : (previous?.windows ?? []),
+    measuredAt: at,
+    ...(previous?.credit === undefined ? {} : { credit: previous.credit }),
+  }
   await update($, snapshot, () => shot)
 }
 
@@ -331,16 +357,21 @@ export const register: Register = (on, options) => {
     const at = Math.max(await read($, now), shot?.measuredAt ?? 0)
     const width = Math.max(10, e.props.bodyColumns - 4)
 
-    // A thin rounded bar where the surface draws SVG, a line of cells elsewhere.
+    // A rounded bar where the surface draws SVG: widths in percent and radii
+    // in pixels, never a stretched viewBox, so the ends stay round at any
+    // width. A line of cells on the terminal.
     const bar = (percent: number) => {
       const used = Math.max(0, Math.min(100, percent))
       if (Svg !== undefined) {
+        const radius = BAR_HEIGHT / 2
         const source =
-          `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="6" viewBox="0 0 100 6" preserveAspectRatio="none">` +
-          `<rect width="100" height="6" rx="3" fill="rgba(128,128,128,0.3)"/>` +
-          (used > 0 ? `<rect width="${used.toFixed(2)}" height="6" rx="3" fill="${BAR_COLOR}"/>` : '') +
+          `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="${BAR_HEIGHT}">` +
+          `<rect x="0" y="0" width="100%" height="${BAR_HEIGHT}" rx="${radius}" ry="${radius}" fill="${TRACK_COLOR}"/>` +
+          (used > 0
+            ? `<rect x="0" y="0" width="${used.toFixed(2)}%" height="${BAR_HEIGHT}" rx="${radius}" ry="${radius}" fill="${BAR_COLOR}"/>`
+            : '') +
           `</svg>`
-        return <Svg source={source} alt={`${Math.round(used)}% 사용됨`} height={6} />
+        return <Svg source={source} alt={`${Math.round(used)}% 사용됨`} height={BAR_HEIGHT} />
       }
 
       const filled = Math.round((used / 100) * width)
@@ -353,7 +384,7 @@ export const register: Register = (on, options) => {
     }
 
     const item = (name: string, value: string, percent: number, note: string | undefined) => (
-      <Box flexDirection="column">
+      <Box flexDirection="column" gap="sm">
         <Box flexDirection="row" justifyContent="space-between" gap={1}>
           <Text weight="semibold" wrap="truncate-end">
             {name}
@@ -371,6 +402,20 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
+    // A cloud session's credential lacks the scope the endpoint asks for, and
+    // the credit comes from the endpoint alone: its row says why it is empty.
+    const isScopeDenied = fetched?.status === 403 && /scope/i.test(fetched.error ?? '')
+    const creditGap =
+      fetched === null
+        ? '불러오는 중입니다'
+        : isScopeDenied
+          ? '이 세션에서는 조회할 수 없습니다 (사용량 조회 권한 없음)'
+          : fetched.status === 429
+            ? '요청이 많아 잠시 뒤에 다시 불러옵니다'
+            : fetched.error !== undefined
+              ? '불러오지 못했습니다'
+              : undefined
+
     const items = [
       ...(shot?.windows ?? []).map(window =>
         item(
@@ -380,21 +425,20 @@ export const register: Register = (on, options) => {
           resetText(window.resetsAt, at, timeZone),
         ),
       ),
-      ...(shot?.credit === undefined
-        ? []
-        : [
+      ...(shot?.credit !== undefined
+        ? [
             item(
               shot.credit.label,
               `${dollars(shot.credit.limit)} 중 ${dollars(shot.credit.remaining)} 남음`,
               shot.credit.percent,
               expiryText(shot.credit.endsAt, timeZone),
             ),
-          ]),
+          ]
+        : creditGap === undefined
+          ? []
+          : [item('클라우드 세션 크레딧', '—', 0, creditGap)]),
     ]
 
-    // A cloud session's credential lacks the scope the endpoint asks for, and
-    // the engine drops the rate-limit headers for the same reason.
-    const isScopeDenied = fetched?.status === 403 && /scope/i.test(fetched.error ?? '')
     const why = [fetched?.status ?? undefined, fetched?.error].filter(part => part !== undefined).join(' ')
     const empty = isScopeDenied
       ? '이 세션의 인증에는 사용량 조회 권한(user:profile)이 없어 사용량을 볼 수 없습니다. 클라우드 세션의 제한입니다.'
@@ -403,9 +447,11 @@ export const register: Register = (on, options) => {
         : '사용량을 불러오는 중입니다'
 
     const card = (
-      <Box key="usage-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>
-        <Text weight="bold">사용량</Text>
-        {items.length === 0 ? (
+      <Box key="usage-card" flexDirection="column" gap="md" borderStyle="round" borderDimColor paddingX={1}>
+        <Text weight="bold" size="heading">
+          사용량
+        </Text>
+        {(shot?.windows.length ?? 0) === 0 && shot?.credit === undefined ? (
           <Text dimColor wrap="wrap">
             {empty}
           </Text>
