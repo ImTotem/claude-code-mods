@@ -1,13 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, RenderElement } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
+// The pane session-rail opens; this mod adds a card to it.
 const PANE = {
   plugin: 'todo-stack',
   component: 'Pane',
-  requestId: 'todo-stack',
+  requestId: 'session-rail',
   props: {
-    title: '할 일',
+    title: '세션',
     isFocused: false,
     bodyColumns: 48,
     placement: 'dock',
@@ -19,14 +20,16 @@ const PANE = {
 type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' }
 
 // What the engine answers beneath the plugin: the session, the prompt, the
-// tools, and what a compaction was told.
+// tools, the pane's own drawing (nothing), and what a compaction was told.
 function engine(on: On, stored: Record<string, unknown> = {}) {
   mock.store(on, stored)
   const seen = { instructions: undefined as string | undefined, filled: undefined as string | undefined }
   let tasks = 0
   on('session.id', () => ({ value: 'session-1' }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.panes', () => ({ value: [] }))
+  on('ui.render', { component: 'Pane' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return h(Box, { key: 'bottom' }) as RenderElement
+  })
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('prompt.fill', ($, e) => {
     seen.filled = e.text
@@ -207,4 +210,57 @@ test('clearing everything asks first', async ($, on) => {
   // Still on the model's list, it is not stacked again.
   await todoWrite($, [{ content: '사라질 일', status: 'pending' }])
   expect(await ui.find({ type: 'Text', text: '사라질 일' })).toBeUndefined()
+})
+
+test('the command adds a todo, and without text lists the open ones', async ($, on) => {
+  engine(on)
+  await ask($, '정리')
+  await todoWrite($, [
+    { content: '로그 확인', status: 'in_progress' },
+    { content: '끝난 일', status: 'completed' },
+  ])
+  const run = (args: string) =>
+    $.command.run({
+      command: 'todo-stack',
+      args,
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: false, columns: 80 },
+    })
+
+  expect(await run('우유 사기')).toMatchObject({ text: '할 일을 추가했습니다: 우유 사기' })
+  expect(await run('')).toMatchObject({ text: '남은 할 일:\n- [대기] 우유 사기\n- [진행 중] 로그 확인' })
+})
+
+test('folding the card leaves its header and the open count', async ($, on) => {
+  engine(on)
+  await ask($, '접기')
+  await todoWrite($, [{ content: '보일 일', status: 'pending' }])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'todo-fold' })
+  expect(await ui.find({ type: 'Text', text: '남은 1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '보일 일' })).toBeUndefined()
+
+  await ui.press({ key: 'todo-fold' })
+  expect(await ui.find({ type: 'Text', text: '보일 일' })).toBeDefined()
+})
+
+test("the card follows the other mods' cards in the pane", {
+  plugins: [
+    {
+      name: 'other-card',
+      register(on) {
+        on('ui.render', { component: 'Pane', requestId: 'session-rail' }, async ($, e, next) => {
+          const { Box, Text } = $.ui.resolve(e)
+          const below = await next(e)
+          return h(Box, { flexDirection: 'column' }, h(Text, {}, 'other card'), below) as RenderElement
+        })
+      },
+    },
+  ],
+}, async ($, on) => {
+  engine(on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = (await ui.findAll({ type: 'Text', text: /^할 일$|other card/ })).map(text => text.text)
+  expect(texts).toEqual(['other card', '할 일'])
 })
