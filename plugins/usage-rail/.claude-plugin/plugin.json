@@ -1,12 +1,20 @@
 {
   "name": "usage-rail",
-  "version": "0.2.1",
-  "description": "Adds a usage card (5-hour and weekly plan limits, context fill, session cost) to the session pane.",
+  "version": "0.3.0",
+  "description": "Adds a usage card to the session pane: session limit, weekly limit and cloud session credit, as the app's usage card shows them.",
   "author": {
     "name": "ImTotem"
   },
   "types": "./types/index.d.ts",
   "dependencies": [
     "session-rail"
-  ]
+  ],
+  "userConfig": {
+    "timeZone": {
+      "type": "string",
+      "title": "시간대",
+      "description": "재설정·만료 시각을 표시할 IANA 시간대 (예: Asia/Seoul, America/Los_Angeles). 클라우드 세션은 UTC로 실행되므로 여기서 정합니다.",
+      "default": "Asia/Seoul"
+    }
+  }
 }
