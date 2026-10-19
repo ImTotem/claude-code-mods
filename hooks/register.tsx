@@ -40,6 +40,16 @@ async function reopen($: EngineInterface) {
   return open($)
 }
 
+// The footer button: open the pane, or close it as the person's own close
+// would, so a prompt does not bring it back.
+async function toggle($: EngineInterface) {
+  if (!(await read($, isOpen))) return reopen($)
+
+  await update($, isDismissed, () => true)
+  await $.ui.close({ id: PANE })
+  await update($, isOpen, () => false)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -98,19 +108,23 @@ export const register: Register = on => {
     )
   })
 
-  // While the pane is not drawn, the band above the prompt offers to open it.
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || (await read($, isOpen))) return next(e)
-
+  // A button at the right of the prompt footer, beside the mode labels,
+  // that opens the pane and closes it again.
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     const { Box, Button } = $.ui.resolve(e)
-    const below = await next(e)
+    const modes = await next(e)
+    const isShown = await read($, isOpen)
 
     return (
-      <Box flexDirection="column">
-        <Box flexDirection="row">
-          <Button key="open-rail" dimColor label="세션 패널 열기" onPress={() => reopen($)} />
-        </Box>
-        {below}
+      <Box flexDirection="row" gap={1}>
+        {modes}
+        <Button
+          key="toggle-rail"
+          plain
+          dimColor={!isShown}
+          label="세션 패널"
+          onPress={() => toggle($)}
+        />
       </Box>
     )
   })
