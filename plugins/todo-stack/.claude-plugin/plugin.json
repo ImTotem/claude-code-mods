@@ -1,6 +1,6 @@
 {
   "name": "todo-stack",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Adds a todo card to the session pane that stacks every todo the model creates, request by request, so none is lost to compaction.",
   "author": {
     "name": "ImTotem"
