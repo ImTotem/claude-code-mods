@@ -169,7 +169,10 @@ async function readNow($: EngineInterface, limits: readonly SessionRateLimit[] |
     await record($, { at, status: null, error: messageOf(error) })
     return undefined
   })
-  if (fetched !== undefined) lastReadAt = at
+  // A refusal (4xx) will not change on the next turn: it waits its minute too.
+  const outcome = await read($, lastFetch)
+  const isRefused = outcome?.at === at && outcome.status !== null && outcome.status >= 400 && outcome.status < 500
+  if (fetched !== undefined || isRefused) lastReadAt = at
 
   const shot = fetched ?? fromHeaders(limits ?? (await $.session.usage()).rateLimits, at)
   await update($, snapshot, () => shot)
@@ -389,8 +392,15 @@ export const register: Register = (on, options) => {
           ]),
     ]
 
+    // A cloud session's credential lacks the scope the endpoint asks for, and
+    // the engine drops the rate-limit headers for the same reason.
+    const isScopeDenied = fetched?.status === 403 && /scope/i.test(fetched.error ?? '')
     const why = [fetched?.status ?? undefined, fetched?.error].filter(part => part !== undefined).join(' ')
-    const empty = fetched?.error !== undefined ? `사용량을 불러오지 못했습니다 (${why})` : '사용량을 불러오는 중입니다'
+    const empty = isScopeDenied
+      ? '이 세션의 인증에는 사용량 조회 권한(user:profile)이 없어 사용량을 볼 수 없습니다. 클라우드 세션의 제한입니다.'
+      : fetched?.error !== undefined
+        ? `사용량을 불러오지 못했습니다 (${why})`
+        : '사용량을 불러오는 중입니다'
 
     const card = (
       <Box key="usage-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>

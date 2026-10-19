@@ -1,6 +1,6 @@
 {
   "name": "usage-rail",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Adds a usage card to the session pane: session limit, weekly limit and cloud session credit, as the app's usage card shows them.",
   "author": {
     "name": "ImTotem"

@@ -224,3 +224,24 @@ test('an answer with no usage rows says so, keeps the answer for a look, and tri
   await seen.clock.advance(1)
   expect(seen.urls).toHaveLength(2)
 })
+
+test("a credential without the profile scope says so, and is not asked again within the minute", async ($, on) => {
+  const refusal = JSON.stringify({
+    type: 'error',
+    error: { type: 'permission_error', message: 'OAuth token does not meet scope requirement user:profile' },
+  })
+  const seen = engine(on, { status: 403, text: refusal }, { ...HEADERS, rateLimits: [] })
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(
+    await ui.find({
+      type: 'Text',
+      text: '이 세션의 인증에는 사용량 조회 권한(user:profile)이 없어 사용량을 볼 수 없습니다. 클라우드 세션의 제한입니다.',
+    }),
+  ).toBeDefined()
+
+  await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
+  await seen.clock.advance(1)
+  expect(seen.urls).toHaveLength(1)
+})
