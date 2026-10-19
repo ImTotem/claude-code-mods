@@ -10,7 +10,7 @@
     {
       "name": "session-rail",
       "source": "./plugins/session-rail",
-      "description": "One session pane that other mods add cards to, with a button above the prompt to reopen it."
+      "description": "One session pane that other mods add cards to, with a button at the right of the prompt footer to open and close it."
     },
     {
       "name": "usage-rail",
