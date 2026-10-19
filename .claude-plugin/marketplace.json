@@ -1,0 +1,19 @@
+{
+  "name": "claude-code-mods",
+  "owner": { "name": "ImTotem" },
+  "metadata": {
+    "description": "Session-rail mods for Claude Code: plan usage limits and a todo stack that survives compaction."
+  },
+  "plugins": [
+    {
+      "name": "usage-rail",
+      "source": { "source": "github", "repo": "ImTotem/claude-code-mods", "ref": "usage-rail" },
+      "description": "Shows plan usage limits (5-hour, weekly), context fill and session cost in a pane on the session rail."
+    },
+    {
+      "name": "todo-stack",
+      "source": { "source": "github", "repo": "ImTotem/claude-code-mods", "ref": "todo-stack" },
+      "description": "Stacks every todo the model creates, request by request, in a pane on the session rail so none is lost to compaction."
+    }
+  ]
+}
