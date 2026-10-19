@@ -15,17 +15,10 @@ const PANE = {
   },
 } as const
 
-const BAND = {
+const FOOTER = {
   plugin: 'session-rail',
-  component: 'AbovePrompt',
-  props: {
-    hasSurvey: false,
-    isWorking: false,
-    maxRows: 10,
-    bodyColumns: 80,
-    scroll: { offset: 0, bodyRows: 10 },
-    view: {},
-  },
+  component: 'SessionMode',
+  props: { modes: ['focus'] },
 } as const
 
 const PROMPT = { text: '작업해줘', wait: false, origin: { kind: 'composer' } } as const
@@ -57,29 +50,44 @@ function surface(on: On, refuses?: string) {
     const { Box } = $.ui.resolve(e)
     return h(Box, { key: 'bottom' }) as RenderElement
   })
-  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return h(Box, { key: 'bottom' }) as RenderElement
+  on('ui.close', () => {
+    seen.isUp = false
+    return { value: undefined }
+  })
+  // The engine's own footer labels.
+  on('ui.render', { component: 'SessionMode' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, { dimColor: true }, e.props.modes.join(' & ')) as RenderElement
   })
 
   return seen
 }
 
-test('while the pane is not drawn the band offers to open it', async ($, on) => {
+test('the footer button sits beside the mode labels and opens and closes the pane', async ($, on) => {
   const seen = surface(on)
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
-  expect(seen.opens).toBe(1)
+  expect(seen.isUp).toBe(false)
 
   for (const surfaceName of ['terminal', 'desktop'] as const) {
-    const band = await $.ui.mount({ ...BAND, surface: surfaceName })
-    expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeDefined()
-    await band.unmount()
+    const footer = await $.ui.mount({ ...FOOTER, surface: surfaceName })
+    const shown = (await footer.findAll({ type: 'Text' })).map(text => text.text)
+    expect(shown).toContain('focus')
+    expect(await footer.find({ type: 'Button', key: 'toggle-rail' })).toBeDefined()
+    await footer.unmount()
   }
 
-  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  await band.press({ key: 'open-rail' })
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  await footer.press({ key: 'toggle-rail' })
   expect(seen.isUp).toBe(true)
-  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeUndefined()
+
+  await footer.press({ key: 'toggle-rail' })
+  expect(seen.isUp).toBe(false)
+
+  // Closed from the button, a prompt does not bring it back; the button does.
+  await $.prompt.submit(PROMPT)
+  expect(seen.isUp).toBe(false)
+  await footer.press({ key: 'toggle-rail' })
+  expect(seen.isUp).toBe(true)
 })
 
 test("the person's prompt opens the pane, once", async ($, on) => {
@@ -93,20 +101,11 @@ test("the person's prompt opens the pane, once", async ($, on) => {
   expect(seen.opens).toBe(2)
 })
 
-test('a pane no surface places is reported once, and the band stays', async ($, on) => {
+test('a pane no surface places is reported once', async ($, on) => {
   const seen = surface(on, 'no attached surface places panes')
   await $.prompt.submit(PROMPT)
   await $.prompt.submit(PROMPT)
   expect(seen.toasts).toEqual(['세션 패널을 열지 못했습니다: no attached surface places panes'])
-
-  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeDefined()
-})
-
-test('a survey keeps the band', async ($, on) => {
-  surface(on)
-  const band = await $.ui.mount({ ...BAND, props: { ...BAND.props, hasSurvey: true }, surface: 'desktop' })
-  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeUndefined()
 })
 
 test('the command opens the pane and says so', async ($, on) => {
@@ -155,7 +154,7 @@ test("the pane stacks the other mods' cards", {
   }
 })
 
-test("another mod's command opening the pane clears the band", {
+test("another mod's command opening the pane marks it open for the button", {
   plugins: [
     {
       name: 'other-mod',
@@ -174,9 +173,6 @@ test("another mod's command opening the pane clears the band", {
 }, async ($, on) => {
   const seen = surface(on)
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
-  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeDefined()
-
   await $.command.run({
     command: 'other',
     args: '',
@@ -184,5 +180,9 @@ test("another mod's command opening the pane clears the band", {
     presentation: { isFullscreen: false, columns: 80 },
   })
   expect(seen.isUp).toBe(true)
-  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeUndefined()
+
+  // So the button's next press closes it rather than opening it again.
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  await footer.press({ key: 'toggle-rail' })
+  expect(seen.isUp).toBe(false)
 })
