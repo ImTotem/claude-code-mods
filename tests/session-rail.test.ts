@@ -154,3 +154,35 @@ test("the pane stacks the other mods' cards", {
     await pane.unmount()
   }
 })
+
+test("another mod's command opening the pane clears the band", {
+  plugins: [
+    {
+      name: 'other-mod',
+      register(on) {
+        on('session.start', async ($, e, next) => {
+          await $.command.register({ name: 'other', description: 'opens the session pane' })
+          return next(e)
+        })
+        on('command.run', { command: 'other' }, async $ => {
+          await $.ui.open({ id: 'session-rail', title: '세션' })
+          return { text: 'opened' }
+        })
+      },
+    },
+  ],
+}, async ($, on) => {
+  const seen = surface(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeDefined()
+
+  await $.command.run({
+    command: 'other',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
+  expect(seen.isUp).toBe(true)
+  expect(await band.find({ type: 'Button', key: 'open-rail' })).toBeUndefined()
+})

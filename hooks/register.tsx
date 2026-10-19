@@ -68,6 +68,17 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // usage-rail's and todo-stack's commands open this pane too.
+  on('ui.open', { id: PANE }, async ($, e, next) => {
+    const opened = await next(e)
+    if (opened.value?.isPlaced === true) {
+      await update($, isOpen, () => true)
+      await update($, isDismissed, () => false)
+    }
+
+    return opened
+  }).catch(($, e, next) => next(e))
+
   on('ui.close', { id: PANE }, async ($, e, next) => {
     await update($, isOpen, () => false)
     if (e.origin.kind === 'person') await update($, isDismissed, () => true)
