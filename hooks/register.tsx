@@ -13,9 +13,13 @@ import type { UsageLimit, UsageSnapshot } from '../types'
 const PANE = 'usage-rail'
 const TITLE = '사용량'
 const TICK_MS = 30_000
+// Prompts the person typed, here or through Remote Control.
+const PERSONAL_ORIGINS: readonly string[] = ['composer', 'bridge']
 
 const snapshot = atom({ plugin: 'usage-rail', key: 'snapshot' } as const, null)
 const now = atom({ plugin: 'usage-rail', key: 'now' } as const, 0)
+const isDismissed = atom({ plugin: 'usage-rail', key: 'isDismissed' } as const, false)
+const isWarned = atom({ plugin: 'usage-rail', key: 'isWarned' } as const, false)
 
 // The windows the settings' Usage screen lists, in its order; any other kind
 // the API reports is drawn after them under its own name.
@@ -104,6 +108,21 @@ function ago(ms: number): string {
   return `${Math.floor(minutes / 60)}시간 전`
 }
 
+// The open session.start makes is unasked, and an unasked pane waits undrawn
+// below 144 columns, which an app's transcript seldom reaches; one made from
+// the person's own prompt is placed at any width.
+async function showPane($: EngineInterface) {
+  if (await read($, isDismissed)) return
+  const pane = (await $.ui.panes()).find(one => one.id === PANE)
+  if (pane?.isPlaced === true) return
+
+  const opened = await $.ui.open({ id: PANE, title: TITLE })
+  if (opened.isPlaced || (await read($, isWarned))) return
+
+  await update($, isWarned, () => true)
+  $.ui.toast(`사용량 패널을 열지 못했습니다: ${opened.reason}`)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -124,6 +143,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'usage-rail' }, async $ => {
     await refresh($).catch(() => undefined)
+    await update($, isDismissed, () => false)
     const opened = await $.ui.open({ id: PANE, title: TITLE })
 
     return {
@@ -132,6 +152,20 @@ export const register: Register = on => {
         : `사용량 패널을 열지 못했습니다: ${opened.reason}`,
     }
   })
+
+  on('prompt.submit', async ($, e, next) => {
+    if (e.isMeta !== true && PERSONAL_ORIGINS.includes(e.origin.kind)) {
+      await showPane($).catch(() => undefined)
+    }
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (e.origin.kind === 'person') await update($, isDismissed, () => true)
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
     await refresh($, e)

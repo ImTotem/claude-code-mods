@@ -76,3 +76,58 @@ test('the command opens the pane and reports when it could not', async ($, on) =
   })
   expect(ran).toMatchObject({ text: '사용량 패널을 열지 못했습니다: too narrow' })
 })
+
+// A surface stand-in: what `$.ui.open` placed, as `$.ui.panes()` lists it.
+function surface(on: On, placed: { reason?: string } = {}) {
+  const seen = { opens: 0, toasts: [] as string[], isUp: false }
+  on('ui.panes', () => ({
+    value: seen.isUp ? [{ id: 'usage-rail', title: '사용량', isShown: true, isFocused: false, isPlaced: true }] : [],
+  }))
+  on('ui.open', () => {
+    seen.opens += 1
+    if (placed.reason !== undefined) return { value: { isPlaced: false, reason: placed.reason } }
+    seen.isUp = true
+    return { value: { isPlaced: true } }
+  })
+  on('ui.toast', ($, e) => {
+    seen.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+
+  return seen
+}
+
+const PROMPT = { text: '작업해줘', wait: false, origin: { kind: 'composer' } } as const
+const COMMAND = {
+  command: 'usage-rail',
+  args: '',
+  origin: { kind: 'composer' },
+  presentation: { isFullscreen: false, columns: 80 },
+} as const
+
+// The person's own close (the pane's close mark) is the engine's to raise and
+// a test cannot: isDismissed is left to the session.
+test("the person's prompt opens the pane once; the command opens it again", async ($, on) => {
+  engine(on)
+  const seen = surface(on)
+
+  await $.prompt.submit(PROMPT)
+  expect(seen.opens).toBe(1)
+  await $.prompt.submit(PROMPT)
+  expect(seen.opens).toBe(1)
+
+  await $.command.run(COMMAND)
+  expect(seen.opens).toBe(2)
+  expect(seen.isUp).toBe(true)
+})
+
+test('a pane no surface places is reported once', async ($, on) => {
+  engine(on)
+  const seen = surface(on, { reason: 'no attached surface places panes' })
+
+  await $.prompt.submit(PROMPT)
+  await $.prompt.submit(PROMPT)
+  expect(seen.opens).toBe(2)
+  expect(seen.toasts).toEqual(['사용량 패널을 열지 못했습니다: no attached surface places panes'])
+})
