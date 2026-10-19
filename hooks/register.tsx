@@ -10,8 +10,10 @@ import type {
 
 import type { UsageLimit, UsageSnapshot } from '../types'
 
-// The pane session-rail opens; this mod adds its card to it.
+// The pane session-rail opens; this mod adds its card to it, and opens it
+// too: a pane id is one pane whichever plugin opens it.
 const RAIL = 'session-rail'
+const RAIL_TITLE = '세션'
 const TICK_MS = 30_000
 
 const snapshot = atom({ plugin: 'usage-rail', key: 'snapshot' } as const, null)
@@ -117,30 +119,11 @@ function label(kind: string): string {
   return LABELS[kind] ?? kind
 }
 
-// What /usage-rail answers, for a surface with no pane.
-function summary(shot: UsageSnapshot | null, at: number): string {
-  if (shot === null) return '아직 측정된 사용량이 없습니다.'
-
-  const lines = shot.limits.map(limit => {
-    const reset = untilReset(limit.resetsAt, at)
-    return `${label(limit.kind)}: ${Math.round(limit.percentUsed)}%${reset === undefined ? '' : ` · ${reset}`}`
-  })
-  if (lines.length === 0) lines.push('플랜 한도: 아직 정보가 없습니다 (첫 응답 이후, 구독 계정에서만 제공)')
-  if (shot.contextPercent !== undefined) {
-    lines.push(
-      `컨텍스트: ${shot.contextPercent}% (${tokens(shot.contextTokens ?? 0)} / ${tokens(shot.contextWindow)} 토큰)`,
-    )
-  }
-  if (shot.costUsd !== undefined) lines.push(`세션 비용: $${shot.costUsd.toFixed(2)}`)
-
-  return lines.join('\n')
-}
-
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-rail',
-      description: '사용량(5시간·주간 한도, 컨텍스트, 비용)을 새로 불러와 보여줍니다',
+      description: '세션 패널을 열어 사용량(5시간·주간 한도, 컨텍스트, 비용)을 보여줍니다',
     })
 
     if (e.isInteractive) {
@@ -155,8 +138,13 @@ export const register: Register = on => {
 
   on('command.run', { command: 'usage-rail' }, async $ => {
     await refresh($).catch(() => undefined)
+    const opened = await $.ui.open({ id: RAIL, title: RAIL_TITLE })
 
-    return { text: summary(await read($, snapshot), await $.clock.now()) }
+    return {
+      text: opened.isPlaced
+        ? '사용량 패널을 열었습니다.'
+        : `사용량 패널을 열지 못했습니다: ${opened.reason}`,
+    }
   })
 
   on('session.measure', async ($, e, next) => {
@@ -235,16 +223,7 @@ export const register: Register = on => {
         {!isFolded && (
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text dimColor>{shot === null ? '측정 전' : `갱신 ${ago(at - shot.measuredAt)}`}</Text>
-            <Button
-              key="usage-refresh"
-              plain
-              dimColor
-              label="새로 불러오기"
-              onPress={async () => {
-                await refresh($)
-                $.ui.toast('사용량을 새로 불러왔습니다')
-              }}
-            />
+            <Button key="usage-refresh" plain dimColor label="새로고침" onPress={() => refresh($)} />
           </Box>
         )}
       </Box>
