@@ -151,7 +151,10 @@ test("where the endpoint refuses, the last response's headers stand in", async (
   const shown = await texts(ui)
   expect(shown).toContain('12% 사용됨')
   expect(shown).toContain('2시간 후 재설정')
-  expect(shown).not.toContain('클라우드 세션 크레딧')
+  // The credit comes from the endpoint alone: its row stays, saying why it is empty.
+  expect(shown).toContain('클라우드 세션 크레딧')
+  expect(shown).toContain('—')
+  expect(shown).toContain('불러오지 못했습니다')
 })
 
 test('with nothing to show the card says why', async ($, on) => {
@@ -219,13 +222,17 @@ test('an answer with no usage rows says so, keeps the answer for a look, and tri
     await ui.find({ type: 'Text', text: '사용량을 불러오지 못했습니다 (200 no usage rows in the answer (unknown_window))' }),
   ).toBeDefined()
 
-  // A failed read leaves no minute to wait: the next prompt reads again.
+  // A failed read is tried again a minute later, not on the very next prompt.
+  await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
+  await seen.clock.advance(1)
+  expect(seen.urls).toHaveLength(1)
+  await seen.clock.advance(60_000)
   await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
   await seen.clock.advance(1)
   expect(seen.urls).toHaveLength(2)
 })
 
-test("a credential without the profile scope says so, and is not asked again within the minute", async ($, on) => {
+test("a credential without the profile scope says so, and is not asked again for half an hour", async ($, on) => {
   const refusal = JSON.stringify({
     type: 'error',
     error: { type: 'permission_error', message: 'OAuth token does not meet scope requirement user:profile' },
@@ -241,7 +248,62 @@ test("a credential without the profile scope says so, and is not asked again wit
     }),
   ).toBeDefined()
 
+  await seen.clock.advance(29 * 60_000)
   await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
   await seen.clock.advance(1)
   expect(seen.urls).toHaveLength(1)
+  await seen.clock.advance(60_000)
+  await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
+  await seen.clock.advance(1)
+  expect(seen.urls).toHaveLength(2)
+})
+
+test('in a cloud session the windows come from the headers and the credit row says why it is empty', async (
+  $,
+  on,
+) => {
+  const refusal = JSON.stringify({
+    type: 'error',
+    error: { type: 'permission_error', message: 'OAuth token does not meet scope requirement user:profile' },
+  })
+  const seen = engine(on, { status: 403, text: refusal })
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const shown = await texts(ui)
+  expect(shown).toContain('세션 한도')
+  expect(shown).toContain('12% 사용됨')
+  expect(shown).toContain('클라우드 세션 크레딧')
+  expect(shown).toContain('이 세션에서는 조회할 수 없습니다 (사용량 조회 권한 없음)')
+})
+
+test('a rate-limited read says so and waits ten minutes', async ($, on) => {
+  const limited = JSON.stringify({ error: { type: 'rate_limit_error', message: 'Rate limited. Please try again later.' } })
+  const seen = engine(on, { status: 429, text: limited })
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '요청이 많아 잠시 뒤에 다시 불러옵니다' })).toBeDefined()
+
+  await seen.clock.advance(9 * 60_000)
+  await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
+  await seen.clock.advance(1)
+  expect(seen.urls).toHaveLength(1)
+  await seen.clock.advance(60_000)
+  await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
+  await seen.clock.advance(1)
+  expect(seen.urls).toHaveLength(2)
+})
+
+test('the bar keeps round ends: widths in percent, radii in pixels, nothing stretched', async ($, on) => {
+  const seen = engine(on)
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const [first] = await ui.findAll({ type: 'Svg' })
+  const source = String(first?.props.source)
+  expect(source).not.toContain('preserveAspectRatio')
+  expect(source).toContain('width="100%" height="8"')
+  expect(source).toContain('width="29.00%" height="8" rx="4"')
+  expect(first?.props.height).toBe(8)
 })
