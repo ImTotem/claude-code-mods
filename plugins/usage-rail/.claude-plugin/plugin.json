@@ -1,9 +1,12 @@
 {
   "name": "usage-rail",
-  "version": "0.1.1",
-  "description": "Shows plan usage limits (5-hour, weekly), context fill and session cost in a pane on the session rail.",
+  "version": "0.2.0",
+  "description": "Adds a usage card (5-hour and weekly plan limits, context fill, session cost) to the session pane.",
   "author": {
     "name": "ImTotem"
   },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "dependencies": [
+    "session-rail"
+  ]
 }
