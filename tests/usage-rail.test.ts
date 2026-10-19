@@ -42,7 +42,7 @@ const HEADERS: SessionUsage = {
   rateLimits: [{ kind: 'five_hour', percentUsed: 12, resetsAt: '2026-10-19T02:00:00Z' }],
 }
 
-type Answer = { status: number; text: string } | 'no-credential'
+type Answer = { status: number; text: string } | 'no-credential' | 'silent'
 
 // The engine beneath the plugin: the clock, the session's credential, the
 // network, the headers' figures, the pane's own drawing (nothing), the opens.
@@ -51,21 +51,24 @@ function engine(
   answer: Answer = { status: 200, text: JSON.stringify(ENDPOINT) },
   headers: SessionUsage = HEADERS,
 ) {
-  mock.clock(on, { now: NOW })
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
   mock.env(on, { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' })
-  const seen = { urls: [] as string[], opens: [] as string[] }
+  const seen = { urls: [] as string[], opens: [] as string[], clock }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.authorize', () => ({
     value: answer === 'no-credential' ? null : { handle: 'handle-1', kind: 'bearer' as const },
   }))
-  on('http.fetch', ($, e) => {
+  on('http.fetch', async ($, e) => {
     seen.urls.push(e.url)
-    const { status, text } = answer === 'no-credential' ? { status: 0, text: '' } : answer
+    if (answer === 'silent') await new Promise(() => undefined)
+    const { status, text } = typeof answer === 'string' ? { status: 0, text: '' } : answer
     return { value: { status, ok: status >= 200 && status < 300, headers: {}, text } }
   })
   on('session.usage', () => ({ value: headers }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
   on('ui.render', { component: 'Pane' }, ($, e) => {
     const { Box } = $.ui.resolve(e)
     return h(Box, { key: 'bottom' }) as RenderElement
@@ -78,8 +81,10 @@ function engine(
   return seen
 }
 
-async function start($: Engine) {
-  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+// As the app hosts a cloud session: not interactive. The read runs on a timer.
+async function start($: Engine, seen: ReturnType<typeof engine>) {
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: false })
+  await seen.clock.advance(1)
 }
 
 const texts = async (ui: { findAll: (query: { type: string }) => Promise<{ text: string }[]> }) =>
@@ -87,7 +92,7 @@ const texts = async (ui: { findAll: (query: { type: string }) => Promise<{ text:
 
 test("the card shows the app's three rows, in its words", async ($, on) => {
   const seen = engine(on)
-  await start($)
+  await start($, seen)
   expect(seen.urls).toEqual(['https://api.anthropic.com/api/oauth/usage'])
 
   for (const surface of ['desktop', 'terminal', 'mobile'] as const) {
@@ -113,8 +118,8 @@ test("the card shows the app's three rows, in its words", async ($, on) => {
 })
 
 test('the bar is an SVG where the surface draws one, a line of cells on the terminal', async ($, on) => {
-  engine(on)
-  await start($)
+  const seen = engine(on)
+  await start($, seen)
 
   const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await desktop.findAll({ type: 'Svg' })).toHaveLength(3)
@@ -129,8 +134,8 @@ test('the time zone option sets how resets and expiry read', { options: { timeZo
   $,
   on,
 ) => {
-  engine(on)
-  await start($)
+  const seen = engine(on)
+  await start($, seen)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const shown = await texts(ui)
@@ -139,8 +144,8 @@ test('the time zone option sets how resets and expiry read', { options: { timeZo
 })
 
 test("where the endpoint refuses, the last response's headers stand in", async ($, on) => {
-  engine(on, { status: 401, text: 'unauthorized' })
-  await start($)
+  const seen = engine(on, { status: 401, text: 'unauthorized' })
+  await start($, seen)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const shown = await texts(ui)
@@ -150,8 +155,8 @@ test("where the endpoint refuses, the last response's headers stand in", async (
 })
 
 test('with nothing to show the card says why', async ($, on) => {
-  engine(on, 'no-credential', { ...HEADERS, rateLimits: [] })
-  await start($)
+  const seen = engine(on, 'no-credential', { ...HEADERS, rateLimits: [] })
+  await start($, seen)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '사용량을 불러오지 못했습니다 (no first-party credential)' })).toBeDefined()
@@ -171,8 +176,8 @@ test("the card leads the pane and keeps the other mods' cards below it", {
     },
   ],
 }, async ($, on) => {
-  engine(on)
-  await start($)
+  const seen = engine(on)
+  await start($, seen)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const shown = (await texts(ui)).filter(text => text === '사용량' || text === 'other card')
@@ -189,4 +194,33 @@ test('the command opens the session pane', async ($, on) => {
   })
   expect(ran).toMatchObject({ text: '사용량 패널을 열었습니다.' })
   expect(seen.opens).toEqual(['session-rail'])
+})
+
+test('a read that never answers ends as a failure after 15 seconds', async ($, on) => {
+  const seen = engine(on, 'silent', { ...HEADERS, rateLimits: [] })
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '사용량을 불러오는 중입니다' })).toBeDefined()
+
+  await seen.clock.advance(15_000)
+  expect(await ui.find({ type: 'Text', text: '사용량을 불러오지 못했습니다 (no answer in 15s)' })).toBeDefined()
+})
+
+test('an answer with no usage rows says so, keeps the answer for a look, and tries again', async ($, on) => {
+  const seen = engine(on, { status: 200, text: JSON.stringify({ unknown_window: { utilization: 3 } }) }, {
+    ...HEADERS,
+    rateLimits: [],
+  })
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(
+    await ui.find({ type: 'Text', text: '사용량을 불러오지 못했습니다 (200 no usage rows in the answer (unknown_window))' }),
+  ).toBeDefined()
+
+  // A failed read leaves no minute to wait: the next prompt reads again.
+  await $.prompt.submit({ text: '다음', wait: false, origin: { kind: 'composer' } })
+  await seen.clock.advance(1)
+  expect(seen.urls).toHaveLength(2)
 })
