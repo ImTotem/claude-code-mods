@@ -1,135 +1,240 @@
 import { atom, read, update } from 'claude-code'
-import type {
-  Color,
-  EngineInterface,
-  Register,
-  SessionContextUsage,
-  SessionCost,
-  SessionRateLimit,
-} from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { UsageLimit, UsageSnapshot } from '../types'
+import type { UsageCredit, UsageFetch, UsageSnapshot, UsageWindow } from '../types'
 
 // The pane session-rail opens; this mod adds its card to it, and opens it
 // too: a pane id is one pane whichever plugin opens it.
 const RAIL = 'session-rail'
 const RAIL_TITLE = '세션'
+// The endpoint the Usage screen reads, called with the session's own
+// credential through $.session.authorize; never more than once a minute.
+const USAGE_PATH = '/api/oauth/usage'
+const FETCH_GAP_MS = 60_000
+const POLL_MS = 5 * 60_000
 const TICK_MS = 30_000
+const BAR_COLOR = '#3d7eea'
+
+// The windows the app's usage card shows, in its order and words.
+const LABELS: Record<string, string> = {
+  five_hour: '세션 한도',
+  seven_day: '매주',
+}
+const KINDS = Object.keys(LABELS)
+const WEEKDAYS: Record<string, string> = {
+  Sun: '일',
+  Mon: '월',
+  Tue: '화',
+  Wed: '수',
+  Thu: '목',
+  Fri: '금',
+  Sat: '토',
+}
 
 const snapshot = atom({ plugin: 'usage-rail', key: 'snapshot' } as const, null)
 const now = atom({ plugin: 'usage-rail', key: 'now' } as const, 0)
-const isCollapsed = atom({ plugin: 'usage-rail', key: 'isCollapsed' } as const, false)
+const lastFetch = atom({ plugin: 'usage-rail', key: 'lastFetch' } as const, null)
 
-// The windows the settings' Usage screen lists, in its order; any other kind
-// the API reports is drawn after them under its own name.
-const LABELS: Record<string, string> = {
-  five_hour: '현재 세션 (5시간)',
-  seven_day: '주간 · 모든 모델',
-  seven_day_opus: '주간 · Opus',
-  seven_day_sonnet: '주간 · Sonnet',
-  spend_limit: '지출 한도',
+type Json = Record<string, unknown>
+
+const isRecord = (value: unknown): value is Json =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+const numberOf = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined)
+const stringOf = (value: unknown) => (typeof value === 'string' && value !== '' ? value : undefined)
+
+// The usage endpoint's credit with dollars and periods: the cloud session
+// credit. Its current period's end is when the credit expires.
+function creditOf(body: Json, at: number): UsageCredit | undefined {
+  const raw = body.wattle_ember
+  if (!isRecord(raw)) return undefined
+
+  const limit = numberOf(raw.limit_dollars)
+  const used = numberOf(raw.used_dollars)
+  const remaining =
+    numberOf(raw.remaining_dollars) ?? (limit !== undefined && used !== undefined ? limit - used : undefined)
+  if (limit === undefined || remaining === undefined) return undefined
+
+  const periods = Array.isArray(raw.periods) ? raw.periods.filter(isRecord) : []
+  const current = periods.find(period => {
+    const starts = Date.parse(stringOf(period.starts_at) ?? '')
+    const ends = Date.parse(stringOf(period.ends_at) ?? '')
+    return starts <= at && at < ends
+  })
+  const endsAt = stringOf(current?.ends_at) ?? stringOf(raw.resets_at)
+  const label = stringOf(raw.label)
+
+  const credit: UsageCredit = {
+    label: label === undefined || /cloud session/i.test(label) ? '클라우드 세션 크레딧' : label,
+    currency: 'USD',
+    limit,
+    remaining,
+    percent: numberOf(raw.utilization) ?? (limit > 0 ? ((limit - remaining) / limit) * 100 : 0),
+  }
+  if (endsAt !== undefined) credit.endsAt = endsAt
+
+  return credit
 }
-const ORDER = Object.keys(LABELS)
-// The names the folded card's one line uses.
-const SHORT: Record<string, string> = {
-  five_hour: '5시간',
-  seven_day: '주간',
-  seven_day_opus: 'Opus',
-  seven_day_sonnet: 'Sonnet',
-  spend_limit: '지출',
-}
 
-type Figures = {
-  rateLimits: readonly SessionRateLimit[]
-  context: SessionContextUsage
-  cost?: SessionCost
-}
+function fromEndpoint(body: Json, at: number): UsageSnapshot {
+  const windows: UsageWindow[] = []
+  for (const kind of KINDS) {
+    const raw = body[kind]
+    const percent = isRecord(raw) ? numberOf(raw.utilization) : undefined
+    if (!isRecord(raw) || percent === undefined) continue
 
-// State takes JSON data only, so fields the engine has no figure for are left
-// out rather than written as undefined.
-function toSnapshot(figures: Figures, measuredAt: number): UsageSnapshot {
-  const limits: UsageLimit[] = figures.rateLimits.map(({ kind, percentUsed, resetsAt }) =>
-    resetsAt === undefined ? { kind, percentUsed } : { kind, percentUsed, resetsAt },
-  )
-  const rank = (kind: string) => (ORDER.includes(kind) ? ORDER.indexOf(kind) : ORDER.length)
-  limits.sort((a, b) => rank(a.kind) - rank(b.kind))
+    const resetsAt = stringOf(raw.resets_at)
+    windows.push(resetsAt === undefined ? { kind, percent } : { kind, percent, resetsAt })
+  }
 
-  const shot: UsageSnapshot = { limits, contextWindow: figures.context.window, measuredAt }
-  if (figures.context.tokens !== undefined) shot.contextTokens = figures.context.tokens
-  if (figures.context.percent !== undefined) shot.contextPercent = figures.context.percent
-  if (figures.cost !== undefined) shot.costUsd = figures.cost.usd
+  const shot: UsageSnapshot = { windows, measuredAt: at }
+  const credit = creditOf(body, at)
+  if (credit !== undefined) shot.credit = credit
 
   return shot
 }
 
-async function refresh($: EngineInterface, figures?: Figures) {
+// What the last response's rate-limit headers said, where the endpoint
+// cannot be read (no first-party credential, a gateway).
+function fromHeaders(limits: readonly SessionRateLimit[], at: number): UsageSnapshot {
+  const windows = limits
+    .filter(limit => KINDS.includes(limit.kind))
+    .map(({ kind, percentUsed, resetsAt }) =>
+      resetsAt === undefined ? { kind, percent: percentUsed } : { kind, percent: percentUsed, resetsAt },
+    )
+    .sort((a, b) => KINDS.indexOf(a.kind) - KINDS.indexOf(b.kind))
+
+  return { windows, measuredAt: at }
+}
+
+async function readEndpoint($: EngineInterface, at: number): Promise<UsageSnapshot | undefined> {
+  const record = (fetched: UsageFetch) => update($, lastFetch, () => fetched)
+
+  const authorization = await $.session.authorize()
+  if (authorization === null) {
+    await record({ at, status: null, error: 'no first-party credential' })
+    return undefined
+  }
+
+  const base = ((await $.env.get('ANTHROPIC_BASE_URL')) ?? 'https://api.anthropic.com').replace(/\/+$/, '')
+  const response = await $.http.fetch(`${base}${USAGE_PATH}`, {
+    auth: authorization.handle,
+    headers: { accept: 'application/json', 'anthropic-beta': 'oauth-2025-04-20' },
+  })
+  if (!response.ok) {
+    await record({ at, status: response.status, error: response.text.slice(0, 200) })
+    return undefined
+  }
+
+  const body: unknown = JSON.parse(response.text)
+  await record({ at, status: response.status })
+
+  return isRecord(body) ? fromEndpoint(body, at) : undefined
+}
+
+let lastReadAt = 0
+
+async function refresh($: EngineInterface, limits?: readonly SessionRateLimit[], force = false) {
   const at = await $.clock.now()
-  const shot = toSnapshot(figures ?? (await $.session.usage()), at)
-  await update($, snapshot, () => shot)
   await update($, now, () => at)
+  if (!force && at - lastReadAt < FETCH_GAP_MS) return
+
+  lastReadAt = at
+  const fetched = await readEndpoint($, at).catch(async (error: unknown) => {
+    await update($, lastFetch, () => ({ at, status: null, error: String(error).slice(0, 200) }))
+    return undefined
+  })
+  const shot = fetched ?? fromHeaders(limits ?? (await $.session.usage()).rateLimits, at)
+  await update($, snapshot, () => shot)
 }
 
-function bar(percent: number, width: number): string {
-  const filled = Math.round((Math.max(0, Math.min(100, percent)) / 100) * width)
+// Wall-clock parts in the configured zone; UTC where the zone is unknown.
+function clockAt(ms: number, timeZone: string) {
+  const date = new Date(ms)
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+      hourCycle: 'h23',
+      timeZoneName: 'shortOffset',
+    }).formatToParts(date)
+    const part = (type: string) => parts.find(one => one.type === type)?.value ?? ''
 
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
+    return {
+      month: Number(part('month')),
+      day: Number(part('day')),
+      weekday: WEEKDAYS[part('weekday')] ?? part('weekday'),
+      hour: Number(part('hour')),
+      minute: part('minute'),
+      zone: part('timeZoneName'),
+    }
+  } catch {
+    return {
+      month: date.getUTCMonth() + 1,
+      day: date.getUTCDate(),
+      weekday: Object.values(WEEKDAYS)[date.getUTCDay()] ?? '',
+      hour: date.getUTCHours(),
+      minute: String(date.getUTCMinutes()).padStart(2, '0'),
+      zone: 'UTC',
+    }
+  }
 }
 
-function tone(percent: number): Color {
-  return percent >= 90 ? 'error' : percent >= 70 ? 'warning' : 'success'
+function time(hour: number, minute: string): string {
+  return `${hour < 12 ? '오전' : '오후'} ${hour % 12 === 0 ? 12 : hour % 12}:${minute}`
 }
 
-function untilReset(resetsAt: string | undefined, at: number): string | undefined {
-  const target = resetsAt === undefined ? NaN : Date.parse(resetsAt)
+// "3시간 54분 후 재설정" within a day, "재설정: (일) 오후 9:00" past it.
+function resetText(resetsAt: string | undefined, at: number, timeZone: string): string | undefined {
+  const target = Date.parse(resetsAt ?? '')
   if (Number.isNaN(target)) return undefined
 
   const minutes = Math.max(0, Math.round((target - at) / 60_000))
-  if (minutes < 1) return '곧 초기화'
+  if (minutes < 24 * 60) {
+    const hours = Math.floor(minutes / 60)
+    const rest = minutes % 60
+    if (hours === 0) return `${rest}분 후 재설정`
 
-  const days = Math.floor(minutes / 1440)
-  const hours = Math.floor((minutes % 1440) / 60)
-  const mins = minutes % 60
-  const parts =
-    days > 0
-      ? [`${days}일`, hours > 0 ? `${hours}시간` : '']
-      : hours > 0
-        ? [`${hours}시간`, mins > 0 ? `${mins}분` : '']
-        : [`${mins}분`]
+    return rest === 0 ? `${hours}시간 후 재설정` : `${hours}시간 ${rest}분 후 재설정`
+  }
 
-  return `${parts.filter(Boolean).join(' ')} 후 초기화`
+  const clock = clockAt(target, timeZone)
+
+  return `재설정: (${clock.weekday}) ${time(clock.hour, clock.minute)}`
 }
 
-function tokens(count: number): string {
-  if (count < 1000) return String(count)
+function expiryText(endsAt: string | undefined, timeZone: string): string | undefined {
+  const target = Date.parse(endsAt ?? '')
+  if (Number.isNaN(target)) return undefined
 
-  const thousands = count / 1000
+  const clock = clockAt(target, timeZone)
 
-  return `${thousands >= 100 ? Math.round(thousands) : Math.round(thousands * 10) / 10}k`
+  return `만료: ${clock.month}월 ${clock.day}일 ${time(clock.hour, clock.minute)} ${clock.zone}`
 }
 
-function ago(ms: number): string {
-  const minutes = Math.floor(ms / 60_000)
-  if (minutes < 1) return '방금'
-  if (minutes < 60) return `${minutes}분 전`
-
-  return `${Math.floor(minutes / 60)}시간 전`
+function dollars(amount: number): string {
+  return `US$${Number.isInteger(amount) ? amount : amount.toFixed(2)}`
 }
 
-function label(kind: string): string {
-  return LABELS[kind] ?? kind
-}
+export const register: Register = (on, options) => {
+  const timeZone = typeof options.timeZone === 'string' && options.timeZone !== '' ? options.timeZone : 'UTC'
 
-export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-rail',
-      description: '세션 패널을 열어 사용량(5시간·주간 한도, 컨텍스트, 비용)을 보여줍니다',
+      description: '세션 패널을 열어 사용량(세션 한도, 매주, 클라우드 세션 크레딧)을 보여줍니다',
     })
 
     if (e.isInteractive) {
-      await refresh($).catch(() => undefined)
+      await refresh($, undefined, true).catch(() => undefined)
       $.clock.every(TICK_MS, () => {
         void $.clock.now().then(at => update($, now, () => at))
+      })
+      $.clock.every(POLL_MS, () => {
+        void refresh($).catch(() => undefined)
       })
     }
 
@@ -137,7 +242,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'usage-rail' }, async $ => {
-    await refresh($).catch(() => undefined)
+    await refresh($, undefined, true).catch(() => undefined)
     const opened = await $.ui.open({ id: RAIL, title: RAIL_TITLE })
 
     return {
@@ -147,84 +252,100 @@ export const register: Register = on => {
     }
   })
 
+  // After each turn: read again, at most once a minute.
   on('session.measure', async ($, e, next) => {
-    await refresh($, e)
+    await refresh($, e.rateLimits).catch(() => undefined)
 
     return next(e)
   })
 
   // The card goes above whatever the other mods add, so it leads the pane.
   on('ui.render', { component: 'Pane', requestId: RAIL }, async ($, e, next) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const table = $.ui.resolve(e)
+    const { Box, Text } = table
+    // The terminal's table names an Svg it draws as nothing; it gets cells.
+    const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
     const below = await next(e)
     const shot = await read($, snapshot)
-    const isFolded = await read($, isCollapsed)
+    const fetched = await read($, lastFetch)
     const at = Math.max(await read($, now), shot?.measuredAt ?? 0)
     const width = Math.max(10, e.props.bodyColumns - 4)
 
-    const row = (name: string, value: string, percent: number) => (
+    // A thin rounded bar where the surface draws SVG, a line of cells elsewhere.
+    const bar = (percent: number) => {
+      const used = Math.max(0, Math.min(100, percent))
+      if (Svg !== undefined) {
+        const source =
+          `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="6" viewBox="0 0 100 6" preserveAspectRatio="none">` +
+          `<rect width="100" height="6" rx="3" fill="rgba(128,128,128,0.3)"/>` +
+          (used > 0 ? `<rect width="${used.toFixed(2)}" height="6" rx="3" fill="${BAR_COLOR}"/>` : '') +
+          `</svg>`
+        return <Svg source={source} alt={`${Math.round(used)}% 사용됨`} height={6} />
+      }
+
+      const filled = Math.round((used / 100) * width)
+      return (
+        <Text>
+          <Text color={BAR_COLOR}>{'━'.repeat(filled)}</Text>
+          <Text dimColor>{'━'.repeat(width - filled)}</Text>
+        </Text>
+      )
+    }
+
+    const item = (name: string, value: string, percent: number, note: string | undefined) => (
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between" gap={1}>
-          <Text wrap="truncate-end">{name}</Text>
-          <Text weight="semibold" tabular color={tone(percent)}>
+          <Text weight="semibold" wrap="truncate-end">
+            {name}
+          </Text>
+          <Text dimColor size="footnote" tabular>
             {value}
           </Text>
         </Box>
-        <Text mono color={tone(percent)}>
-          {bar(percent, width)}
-        </Text>
+        {bar(percent)}
+        {note !== undefined && (
+          <Text dimColor size="footnote">
+            {note}
+          </Text>
+        )}
       </Box>
     )
 
-    const limits =
-      shot === null || shot.limits.length === 0 ? (
-        <Text dimColor wrap="wrap">
-          한도 정보가 아직 없습니다. 첫 응답 이후에 표시됩니다. (구독 계정에서만 제공)
-        </Text>
-      ) : (
-        shot.limits.map(limit => (
-          <Box flexDirection="column">
-            {row(label(limit.kind), `${Math.round(limit.percentUsed)}%`, limit.percentUsed)}
-            {untilReset(limit.resetsAt, at) !== undefined && (
-              <Text dimColor>{untilReset(limit.resetsAt, at)}</Text>
-            )}
-          </Box>
-        ))
-      )
+    const items = [
+      ...(shot?.windows ?? []).map(window =>
+        item(
+          LABELS[window.kind] ?? window.kind,
+          `${Math.round(window.percent)}% 사용됨`,
+          window.percent,
+          resetText(window.resetsAt, at, timeZone),
+        ),
+      ),
+      ...(shot?.credit === undefined
+        ? []
+        : [
+            item(
+              shot.credit.label,
+              `${dollars(shot.credit.limit)} 중 ${dollars(shot.credit.remaining)} 남음`,
+              shot.credit.percent,
+              expiryText(shot.credit.endsAt, timeZone),
+            ),
+          ]),
+    ]
 
-    const folded = shot?.limits
-      .slice(0, 2)
-      .map(limit => `${SHORT[limit.kind] ?? limit.kind} ${Math.round(limit.percentUsed)}%`)
-      .join(' · ')
+    const empty =
+      fetched?.error !== undefined
+        ? `사용량을 불러오지 못했습니다 (${fetched.status ?? fetched.error})`
+        : '사용량을 불러오는 중입니다'
 
     const card = (
       <Box key="usage-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>
-        <Box flexDirection="row" justifyContent="space-between" gap={1}>
-          <Button key="usage-fold" plain onPress={() => update($, isCollapsed, isOn => !isOn)}>
-            <Text weight="semibold">사용량</Text>
-            <Text dimColor>{isFolded ? ' ›' : ' ∨'}</Text>
-          </Button>
-          {isFolded && folded !== undefined && folded !== '' && <Text dimColor tabular>{folded}</Text>}
-        </Box>
-        {!isFolded && limits}
-        {!isFolded &&
-          shot?.contextPercent !== undefined &&
-          row(
-            '컨텍스트',
-            `${tokens(shot.contextTokens ?? 0)} / ${tokens(shot.contextWindow)}`,
-            shot.contextPercent,
-          )}
-        {!isFolded && shot?.costUsd !== undefined && (
-          <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Text>세션 비용</Text>
-            <Text tabular>{`$${shot.costUsd.toFixed(2)}`}</Text>
-          </Box>
-        )}
-        {!isFolded && (
-          <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Text dimColor>{shot === null ? '측정 전' : `갱신 ${ago(at - shot.measuredAt)}`}</Text>
-            <Button key="usage-refresh" plain dimColor label="새로고침" onPress={() => refresh($)} />
-          </Box>
+        <Text weight="bold">사용량</Text>
+        {items.length === 0 ? (
+          <Text dimColor wrap="wrap">
+            {empty}
+          </Text>
+        ) : (
+          items
         )}
       </Box>
     )
