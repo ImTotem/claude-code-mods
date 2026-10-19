@@ -1,0 +1,9 @@
+{
+  "name": "todo-stack",
+  "version": "0.1.1",
+  "description": "Stacks every todo the model creates, request by request, in a pane on the session rail so none is lost to compaction.",
+  "author": {
+    "name": "ImTotem"
+  },
+  "types": "./types/index.d.ts"
+}
