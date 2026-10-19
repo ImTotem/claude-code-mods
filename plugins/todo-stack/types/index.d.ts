@@ -37,10 +37,8 @@ declare module 'claude-code' {
       stack: TodoStack
       hideDone: boolean
       isConfirmingClear: boolean
-      // The person closed the pane by hand; it stays closed until /todo-stack.
-      isDismissed: boolean
-      // The pane could not be placed and the person was told once.
-      isWarned: boolean
+      // The person folded the card to its header.
+      isCollapsed: boolean
     }
   }
 }

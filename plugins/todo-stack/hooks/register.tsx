@@ -3,8 +3,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { StackedTodo, TodoGroup, TodoStack, TodoStatus } from '../types'
 
-const PANE = 'todo-stack'
-const TITLE = '할 일'
+// The pane session-rail opens; this mod adds its card to it.
+const RAIL = 'session-rail'
 const MANUAL = 'manual'
 const MAX_GROUPS = 100
 const MAX_SESSIONS = 30
@@ -23,8 +23,7 @@ const stackRef = { plugin: 'todo-stack', key: 'stack' } as const
 const stack = atom(stackRef, EMPTY)
 const hideDone = atom({ plugin: 'todo-stack', key: 'hideDone' } as const, false)
 const isConfirmingClear = atom({ plugin: 'todo-stack', key: 'isConfirmingClear' } as const, false)
-const isDismissed = atom({ plugin: 'todo-stack', key: 'isDismissed' } as const, false)
-const isWarned = atom({ plugin: 'todo-stack', key: 'isWarned' } as const, false)
+const isCollapsed = atom({ plugin: 'todo-stack', key: 'isCollapsed' } as const, false)
 
 type ModelTodo = { content: string; status: TodoStatus }
 type TaskChange = { taskId: string; subject?: string; status?: TodoStatus | 'deleted' }
@@ -295,26 +294,11 @@ async function fillPrompt($: EngineInterface) {
   })
 }
 
-// The open session.start makes is unasked, and an unasked pane waits undrawn
-// below 144 columns, which an app's transcript seldom reaches; one made from
-// the person's own prompt is placed at any width.
-async function showPane($: EngineInterface) {
-  if (await read($, isDismissed)) return
-  const pane = (await $.ui.panes()).find(one => one.id === PANE)
-  if (pane?.isPlaced === true) return
-
-  const opened = await $.ui.open({ id: PANE, title: TITLE })
-  if (opened.isPlaced || (await read($, isWarned))) return
-
-  await update($, isWarned, () => true)
-  $.ui.toast(`할 일 패널을 열지 못했습니다: ${opened.reason}`)
-}
-
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'todo-stack',
-      description: '세션 레일에 할 일 스택을 엽니다. 텍스트를 주면 직접 할 일로 추가합니다',
+      description: '남은 할 일을 보여줍니다. 텍스트를 주면 직접 할 일로 추가합니다',
       argumentHint: '[추가할 할 일]',
     })
 
@@ -324,20 +308,19 @@ export const register: Register = on => {
       if (isStack(saved)) await $.state.set(stackRef, saved)
     }
 
-    if (e.isInteractive) void $.ui.open({ id: PANE, title: TITLE })
-
     return next(e)
   })
 
   on('command.run', { command: 'todo-stack' }, async ($, e) => {
     const text = oneLine(e.args, MAX_TEXT)
-    if (text !== '') await change($, value => addManual(value, text))
+    if (text !== '') {
+      await change($, value => addManual(value, text))
+      return { text: `할 일을 추가했습니다: ${text}` }
+    }
 
-    await update($, isDismissed, () => false)
-    const opened = await $.ui.open({ id: PANE, title: TITLE })
-    const said = text === '' ? '할 일 스택을 열었습니다.' : `할 일을 추가했습니다: ${text}`
+    const list = openList(await read($, stack), status => STATUS_LABEL[status])
 
-    return { text: opened.isPlaced ? said : `${said} (패널을 열지 못했습니다: ${opened.reason})` }
+    return { text: list === '' ? '남은 할 일이 없습니다.' : `남은 할 일:\n${list}` }
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -350,15 +333,6 @@ export const register: Register = on => {
       const text = oneLine(e.text, 140)
       await change($, value => ({ ...value, request: { text } })).catch(() => undefined)
     }
-    if (e.isMeta !== true && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')) {
-      await showPane($).catch(() => undefined)
-    }
-
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
-  on('ui.close', { id: PANE }, async ($, e, next) => {
-    if (e.origin.kind === 'person') await update($, isDismissed, () => true)
 
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -423,7 +397,9 @@ export const register: Register = on => {
     return next({ ...e, instructions })
   }).catch(($, e, next) => next(e))
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  // The card goes below whatever the other mods add, so the usage card leads.
+  on('ui.render', { component: 'Pane', requestId: RAIL }, async ($, e, next) => {
+    const above = await next(e)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const Input = 'Input' in table ? table.Input : undefined
@@ -431,6 +407,7 @@ export const register: Register = on => {
     const value = await read($, stack)
     const isHiding = await read($, hideDone)
     const isConfirming = await read($, isConfirmingClear)
+    const isFolded = await read($, isCollapsed)
 
     const todos = allTodos(value)
     const open = todos.filter(isOpen).length
@@ -501,12 +478,15 @@ export const register: Register = on => {
 
     const summary = `남은 ${open} · 진행 중 ${working} · 완료 ${done}` + (dropped > 0 ? ` · 빠짐 ${dropped}` : '')
 
-    return (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" justifyContent="space-between" gap={1}>
-          <Text size="heading" weight="bold">
-            할 일 스택
-          </Text>
+    const header = (
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Button key="todo-fold" plain onPress={() => update($, isCollapsed, isOn => !isOn)}>
+          <Text weight="semibold">할 일</Text>
+          <Text dimColor>{isFolded ? ' ›' : ' ∨'}</Text>
+        </Button>
+        {isFolded ? (
+          <Text dimColor tabular>{`남은 ${open}`}</Text>
+        ) : (
           <Button
             key="hide"
             plain
@@ -514,7 +494,17 @@ export const register: Register = on => {
             label={isHiding ? '완료 보이기' : '완료 숨기기'}
             onPress={() => update($, hideDone, isOn => !isOn)}
           />
-        </Box>
+        )}
+      </Box>
+    )
+
+    const card = isFolded ? (
+      <Box key="todo-card" flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+        {header}
+      </Box>
+    ) : (
+      <Box key="todo-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>
+        {header}
         <Text dimColor tabular>
           {summary}
         </Text>
@@ -570,6 +560,13 @@ export const register: Register = on => {
             <Button key="clear-no" label="취소" onPress={() => update($, isConfirmingClear, () => false)} />
           )}
         </Box>
+      </Box>
+    )
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {above}
+        {card}
       </Box>
     )
   })
