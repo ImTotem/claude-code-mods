@@ -3,8 +3,10 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { StackedTodo, TodoGroup, TodoStack, TodoStatus } from '../types'
 
-// The pane session-rail opens; this mod adds its card to it.
+// The pane session-rail opens; this mod adds its card to it, and opens it
+// too: a pane id is one pane whichever plugin opens it.
 const RAIL = 'session-rail'
+const RAIL_TITLE = '세션'
 const MANUAL = 'manual'
 const MAX_GROUPS = 100
 const MAX_SESSIONS = 30
@@ -298,7 +300,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'todo-stack',
-      description: '남은 할 일을 보여줍니다. 텍스트를 주면 직접 할 일로 추가합니다',
+      description: '세션 패널을 열어 할 일 스택을 보여줍니다. 텍스트를 주면 직접 할 일로 추가합니다',
       argumentHint: '[추가할 할 일]',
     })
 
@@ -313,14 +315,12 @@ export const register: Register = on => {
 
   on('command.run', { command: 'todo-stack' }, async ($, e) => {
     const text = oneLine(e.args, MAX_TEXT)
-    if (text !== '') {
-      await change($, value => addManual(value, text))
-      return { text: `할 일을 추가했습니다: ${text}` }
-    }
+    if (text !== '') await change($, value => addManual(value, text))
 
-    const list = openList(await read($, stack), status => STATUS_LABEL[status])
+    const opened = await $.ui.open({ id: RAIL, title: RAIL_TITLE })
+    const said = text === '' ? '할 일 스택을 열었습니다.' : `할 일을 추가했습니다: ${text}`
 
-    return { text: list === '' ? '남은 할 일이 없습니다.' : `남은 할 일:\n${list}` }
+    return { text: opened.isPlaced ? said : `${said} (패널을 열지 못했습니다: ${opened.reason})` }
   })
 
   on('prompt.submit', async ($, e, next) => {
