@@ -5,7 +5,7 @@ Claude Code에 `세션` 패널 하나를 띄우고, 거기에 플랜 사용량�
 | 모드 | 개발 브랜치 → 배포 폴더 | 하는 일 |
 | --- | --- | --- |
 | `session-rail` | [`session-rail`](../../tree/session-rail) → [`plugins/session-rail`](plugins/session-rail) | `세션` 패널을 열고, 닫혀 있을 때는 프롬프트 위에 **세션 패널 열기** 버튼을 띄웁니다. 아래 두 모드가 이 패널에 카드를 넣습니다. |
-| `usage-rail` | [`usage-rail`](../../tree/usage-rail) → [`plugins/usage-rail`](plugins/usage-rail) | **사용량** 카드: 설정의 사용량 화면에 나오는 플랜 한도(현재 세션 5시간, 주간 등)를 막대와 초기화까지 남은 시간으로 보여주고, 컨텍스트 사용량과 세션 비용도 함께 보여줍니다. |
+| `usage-rail` | [`usage-rail`](../../tree/usage-rail) → [`plugins/usage-rail`](plugins/usage-rail) | **사용량** 카드: Claude 앱의 사용량 카드처럼 세션 한도 · 매주 · 클라우드 세션 크레딧을 막대와 재설정·만료 시각으로 보여줍니다. |
 | `todo-stack` | [`todo-stack`](../../tree/todo-stack) → [`plugins/todo-stack`](plugins/todo-stack) | **할 일** 카드: 모델이 만드는 할 일을 요청별 그룹으로 묶어 최신 요청이 위에 오도록 계속 쌓습니다. 컨텍스트 압축이나 새 요청 때문에 모델 목록에서 빠진 할 일도 남겨 둡니다. |
 
 `usage-rail`과 `todo-stack`은 `session-rail`을 의존성으로 선언해서, 둘 중 하나를 설치하면 `session-rail`도 함께 설치됩니다. 각 모드의 자세한 사용법은 그 브랜치의 README에 있습니다.

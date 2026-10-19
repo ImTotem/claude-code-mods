@@ -15,7 +15,7 @@
     {
       "name": "usage-rail",
       "source": "./plugins/usage-rail",
-      "description": "Adds a usage card (5-hour and weekly plan limits, context fill, session cost) to the session pane."
+      "description": "Adds a usage card to the session pane: session limit, weekly limit and cloud session credit, as the app's usage card shows them."
     },
     {
       "name": "todo-stack",
