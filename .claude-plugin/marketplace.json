@@ -1,19 +1,26 @@
 {
   "name": "claude-code-mods",
-  "owner": { "name": "ImTotem" },
+  "owner": {
+    "name": "ImTotem"
+  },
   "metadata": {
-    "description": "Session-rail mods for Claude Code: plan usage limits and a todo stack that survives compaction."
+    "description": "Session-rail mods for Claude Code: one session pane with a plan usage card and a todo stack that survives compaction."
   },
   "plugins": [
     {
+      "name": "session-rail",
+      "source": "./plugins/session-rail",
+      "description": "One session pane that other mods add cards to, with a button above the prompt to reopen it."
+    },
+    {
       "name": "usage-rail",
       "source": "./plugins/usage-rail",
-      "description": "Shows plan usage limits (5-hour, weekly), context fill and session cost in a pane on the session rail."
+      "description": "Adds a usage card (5-hour and weekly plan limits, context fill, session cost) to the session pane."
     },
     {
       "name": "todo-stack",
       "source": "./plugins/todo-stack",
-      "description": "Stacks every todo the model creates, request by request, in a pane on the session rail so none is lost to compaction."
+      "description": "Adds a todo card to the session pane that stacks every todo the model creates, request by request, so none is lost to compaction."
     }
   ]
 }
