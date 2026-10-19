@@ -30,22 +30,22 @@ const USAGE: SessionUsage = {
 }
 
 // What the engine answers beneath the plugin: the clock, the figures, the
-// pane's own drawing (nothing), and toasts.
+// pane's own drawing (nothing), and the panes opened.
 function engine(on: On) {
   mock.clock(on, { now: NOW })
-  const toasts: string[] = []
+  const opens: string[] = []
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('session.usage', () => ({ value: USAGE }))
   on('ui.render', { component: 'Pane' }, ($, e) => {
     const { Box } = $.ui.resolve(e)
     return h(Box, { key: 'bottom' }) as RenderElement
   })
-  on('ui.toast', ($, e) => {
-    toasts.push(e.text)
-    return { value: undefined }
+  on('ui.open', ($, e) => {
+    opens.push(e.id)
+    return { value: { isPlaced: true } }
   })
 
-  return toasts
+  return opens
 }
 
 async function measure($: Engine) {
@@ -88,14 +88,13 @@ test('folding the card leaves its header and a one-line summary', async ($, on) 
 })
 
 test('before any reading the card says so, and its button fetches the figures', async ($, on) => {
-  const toasts = engine(on)
+  engine(on)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /한도 정보가 아직 없습니다/ })).toBeDefined()
 
   await ui.press({ key: 'usage-refresh' })
   expect(await ui.find({ type: 'Text', text: '현재 세션 (5시간)' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '갱신 방금' })).toBeDefined()
-  expect(toasts).toEqual(['사용량을 새로 불러왔습니다'])
 })
 
 test("the card leads the pane and keeps the other mods' cards below it", {
@@ -120,19 +119,14 @@ test("the card leads the pane and keeps the other mods' cards below it", {
   expect(texts).toEqual(['사용량', 'other card'])
 })
 
-test('the command answers the figures as text', async ($, on) => {
-  engine(on)
+test('the command opens the session pane', async ($, on) => {
+  const opens = engine(on)
   const ran = await $.command.run({
     command: 'usage-rail',
     args: '',
     origin: { kind: 'composer' },
     presentation: { isFullscreen: false, columns: 80 },
   })
-  expect(ran).toMatchObject({
-    text:
-      '현재 세션 (5시간): 43% · 2시간 13분 후 초기화\n' +
-      '주간 · 모든 모델: 18% · 3일 3시간 후 초기화\n' +
-      '컨텍스트: 41% (81k / 200k 토큰)\n' +
-      '세션 비용: $1.23',
-  })
+  expect(ran).toMatchObject({ text: '사용량 패널을 열었습니다.' })
+  expect(opens).toEqual(['session-rail'])
 })
