@@ -1,0 +1,9 @@
+{
+  "name": "session-rail",
+  "version": "0.1.0",
+  "description": "One session pane that other mods add cards to, with a button above the prompt to reopen it.",
+  "author": {
+    "name": "ImTotem"
+  },
+  "types": "./types/index.d.ts"
+}
