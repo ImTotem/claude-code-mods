@@ -23,12 +23,20 @@ type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' }
 // tools, the pane's own drawing (nothing), and what a compaction was told.
 function engine(on: On, stored: Record<string, unknown> = {}) {
   mock.store(on, stored)
-  const seen = { instructions: undefined as string | undefined, filled: undefined as string | undefined }
+  const seen = {
+    instructions: undefined as string | undefined,
+    filled: undefined as string | undefined,
+    opens: [] as string[],
+  }
   let tasks = 0
   on('session.id', () => ({ value: 'session-1' }))
   on('ui.render', { component: 'Pane' }, ($, e) => {
     const { Box } = $.ui.resolve(e)
     return h(Box, { key: 'bottom' }) as RenderElement
+  })
+  on('ui.open', ($, e) => {
+    seen.opens.push(e.id)
+    return { value: { isPlaced: true } }
   })
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('prompt.fill', ($, e) => {
@@ -212,13 +220,8 @@ test('clearing everything asks first', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: '사라질 일' })).toBeUndefined()
 })
 
-test('the command adds a todo, and without text lists the open ones', async ($, on) => {
-  engine(on)
-  await ask($, '정리')
-  await todoWrite($, [
-    { content: '로그 확인', status: 'in_progress' },
-    { content: '끝난 일', status: 'completed' },
-  ])
+test('the command opens the session pane, adding a todo when given one', async ($, on) => {
+  const seen = engine(on)
   const run = (args: string) =>
     $.command.run({
       command: 'todo-stack',
@@ -227,8 +230,12 @@ test('the command adds a todo, and without text lists the open ones', async ($, 
       presentation: { isFullscreen: false, columns: 80 },
     })
 
+  expect(await run('')).toMatchObject({ text: '할 일 스택을 열었습니다.' })
   expect(await run('우유 사기')).toMatchObject({ text: '할 일을 추가했습니다: 우유 사기' })
-  expect(await run('')).toMatchObject({ text: '남은 할 일:\n- [대기] 우유 사기\n- [진행 중] 로그 확인' })
+  expect(seen.opens).toEqual(['session-rail', 'session-rail'])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '우유 사기' })).toBeDefined()
 })
 
 test('folding the card leaves its header and the open count', async ($, on) => {
