@@ -11,6 +11,7 @@ const RAIL_TITLE = '세션'
 // credential through $.session.authorize; never more than once a minute.
 const USAGE_PATH = '/api/oauth/usage'
 const FETCH_GAP_MS = 60_000
+const READ_TIMEOUT_MS = 15_000
 const POLL_MS = 5 * 60_000
 const TICK_MS = 30_000
 const BAR_COLOR = '#3d7eea'
@@ -106,12 +107,19 @@ function fromHeaders(limits: readonly SessionRateLimit[], at: number): UsageSnap
   return { windows, measuredAt: at }
 }
 
-async function readEndpoint($: EngineInterface, at: number): Promise<UsageSnapshot | undefined> {
-  const record = (fetched: UsageFetch) => update($, lastFetch, () => fetched)
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 200)
 
+// What the last read came to, in state for the card and in the store, so a
+// read that fails in a session nobody can watch can be looked at afterwards.
+async function record($: EngineInterface, fetched: UsageFetch, sample?: unknown) {
+  await update($, lastFetch, () => fetched)
+  await $.store.set('lastFetch', sample === undefined ? fetched : { ...fetched, sample }).catch(() => undefined)
+}
+
+async function readEndpoint($: EngineInterface, at: number): Promise<UsageSnapshot | undefined> {
   const authorization = await $.session.authorize()
   if (authorization === null) {
-    await record({ at, status: null, error: 'no first-party credential' })
+    await record($, { at, status: null, error: 'no first-party credential' })
     return undefined
   }
 
@@ -121,30 +129,66 @@ async function readEndpoint($: EngineInterface, at: number): Promise<UsageSnapsh
     headers: { accept: 'application/json', 'anthropic-beta': 'oauth-2025-04-20' },
   })
   if (!response.ok) {
-    await record({ at, status: response.status, error: response.text.slice(0, 200) })
+    await record($, { at, status: response.status, error: response.text.slice(0, 200) })
     return undefined
   }
 
   const body: unknown = JSON.parse(response.text)
-  await record({ at, status: response.status })
+  const shot = isRecord(body) ? fromEndpoint(body, at) : undefined
+  if (shot === undefined || (shot.windows.length === 0 && shot.credit === undefined)) {
+    const keys = isRecord(body) ? Object.keys(body).join(', ') : typeof body
+    await record($, { at, status: response.status, error: `no usage rows in the answer (${keys})` }, body)
+    return undefined
+  }
 
-  return isRecord(body) ? fromEndpoint(body, at) : undefined
+  await record($, { at, status: response.status })
+
+  return shot
 }
 
-let lastReadAt = 0
+// A read that never answers ends as a failure rather than holding the card.
+function withTimeout<T>($: EngineInterface, work: Promise<T>): Promise<T> {
+  const timeout = $.clock.sleep(READ_TIMEOUT_MS).then(() => {
+    throw new Error(`no answer in ${READ_TIMEOUT_MS / 1000}s`)
+  })
 
-async function refresh($: EngineInterface, limits?: readonly SessionRateLimit[], force = false) {
+  return Promise.race([work, timeout])
+}
+
+// The minute between reads counts from the last read that answered, so a
+// failing read is tried again at the next turn, prompt or open.
+let lastReadAt = 0
+let reading: Promise<void> | undefined
+
+async function readNow($: EngineInterface, limits: readonly SessionRateLimit[] | undefined, force: boolean) {
   const at = await $.clock.now()
   await update($, now, () => at)
   if (!force && at - lastReadAt < FETCH_GAP_MS) return
 
-  lastReadAt = at
-  const fetched = await readEndpoint($, at).catch(async (error: unknown) => {
-    await update($, lastFetch, () => ({ at, status: null, error: String(error).slice(0, 200) }))
+  const fetched = await withTimeout($, readEndpoint($, at)).catch(async (error: unknown) => {
+    await record($, { at, status: null, error: messageOf(error) })
     return undefined
   })
+  if (fetched !== undefined) lastReadAt = at
+
   const shot = fetched ?? fromHeaders(limits ?? (await $.session.usage()).rateLimits, at)
   await update($, snapshot, () => shot)
+}
+
+function refresh($: EngineInterface, limits?: readonly SessionRateLimit[], force = false): Promise<void> {
+  reading ??= readNow($, limits, force).finally(() => {
+    reading = undefined
+  })
+
+  return reading
+}
+
+// Reads started by an event run on a timer of their own, so the event (a
+// session start, a prompt) never waits on the network.
+function refreshLater($: EngineInterface, limits?: readonly SessionRateLimit[]) {
+  $.clock.after(1, () => {
+    void refresh($, limits).catch(() => undefined)
+  })
 }
 
 // Wall-clock parts in the configured zone; UTC where the zone is unknown.
@@ -228,15 +272,14 @@ export const register: Register = (on, options) => {
       description: '세션 패널을 열어 사용량(세션 한도, 매주, 클라우드 세션 크레딧)을 보여줍니다',
     })
 
-    if (e.isInteractive) {
-      await refresh($, undefined, true).catch(() => undefined)
-      $.clock.every(TICK_MS, () => {
-        void $.clock.now().then(at => update($, now, () => at))
-      })
-      $.clock.every(POLL_MS, () => {
-        void refresh($).catch(() => undefined)
-      })
-    }
+    // A session the app hosts reads as not interactive, so nothing waits on it.
+    refreshLater($)
+    $.clock.every(TICK_MS, () => {
+      void $.clock.now().then(at => update($, now, () => at))
+    })
+    $.clock.every(POLL_MS, () => {
+      void refresh($).catch(() => undefined)
+    })
 
     return next(e)
   })
@@ -252,12 +295,26 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // After each turn: read again, at most once a minute.
-  on('session.measure', async ($, e, next) => {
-    await refresh($, e.rateLimits).catch(() => undefined)
+  // After each turn, on each prompt and whenever the pane opens: read again,
+  // at most once a minute after a read that answered.
+  on('session.measure', ($, e, next) => {
+    refreshLater($, e.rateLimits)
 
     return next(e)
   })
+
+  on('prompt.submit', ($, e, next) => {
+    refreshLater($)
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('ui.open', { id: RAIL }, async ($, e, next) => {
+    const opened = await next(e)
+    if (opened.value?.isPlaced === true) refreshLater($)
+
+    return opened
+  }).catch(($, e, next) => next(e))
 
   // The card goes above whatever the other mods add, so it leads the pane.
   on('ui.render', { component: 'Pane', requestId: RAIL }, async ($, e, next) => {
@@ -332,10 +389,8 @@ export const register: Register = (on, options) => {
           ]),
     ]
 
-    const empty =
-      fetched?.error !== undefined
-        ? `사용량을 불러오지 못했습니다 (${fetched.status ?? fetched.error})`
-        : '사용량을 불러오는 중입니다'
+    const why = [fetched?.status ?? undefined, fetched?.error].filter(part => part !== undefined).join(' ')
+    const empty = fetched?.error !== undefined ? `사용량을 불러오지 못했습니다 (${why})` : '사용량을 불러오는 중입니다'
 
     const card = (
       <Box key="usage-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>
