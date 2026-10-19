@@ -1,6 +1,6 @@
 {
   "name": "usage-rail",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Adds a usage card (5-hour and weekly plan limits, context fill, session cost) to the session pane.",
   "author": {
     "name": "ImTotem"
