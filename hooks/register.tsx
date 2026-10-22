@@ -1,18 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { StackedTodo, TodoGroup, TodoStack, TodoStatus } from '../types'
+import type { StackedTodo, TodoStack, TodoStatus } from '../types'
 
 // The pane session-rail opens; this mod adds its card to it, and opens it
 // too: a pane id is one pane whichever plugin opens it.
 const RAIL = 'session-rail'
 const RAIL_TITLE = '세션'
-const MANUAL = 'manual'
-const MAX_GROUPS = 100
+const MAX_TODOS = 300
 const MAX_SESSIONS = 30
 const MAX_TEXT = 500
-// Prompts the person sent; a notification, a peer or a schedule starts no request.
-const PERSONAL_ORIGINS: readonly string[] = ['composer', 'bridge', 'sdk']
 
 const STATUS_LABEL: Record<TodoStatus, string> = {
   pending: '대기',
@@ -20,17 +17,12 @@ const STATUS_LABEL: Record<TodoStatus, string> = {
   completed: '완료',
 }
 
-const EMPTY: TodoStack = { groups: [], request: null, muted: [] }
+const EMPTY: TodoStack = { todos: [], muted: [] }
 const stackRef = { plugin: 'todo-stack', key: 'stack' } as const
 const stack = atom(stackRef, EMPTY)
 const hideDone = atom({ plugin: 'todo-stack', key: 'hideDone' } as const, false)
 const isConfirmingClear = atom({ plugin: 'todo-stack', key: 'isConfirmingClear' } as const, false)
 const isCollapsed = atom({ plugin: 'todo-stack', key: 'isCollapsed' } as const, false)
-const folds = atom({ plugin: 'todo-stack', key: 'folds' } as const, {})
-
-const TITLE_MAX = 60
-// In a group, what is under way first, then what waits, then what is done.
-const STATUS_ORDER: Record<TodoStatus, number> = { in_progress: 0, pending: 1, completed: 2 }
 
 type ModelTodo = { content: string; status: TodoStatus }
 type TaskChange = { taskId: string; subject?: string; status?: TodoStatus | 'deleted' }
@@ -45,100 +37,52 @@ function oneLine(text: string, max: number): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
 
-// A request's first readable line, with HTML comments, code blocks, quote
-// marks, list markers and headings left out, so its group reads as what was
-// asked. Stored titles (one line already) read the same way.
-function titleOf(text: string, max: number): string {
-  const lines = text
-    .replace(/<!--[\s\S]*?-->/g, '\n')
-    .replace(/```[\s\S]*?```/g, '\n')
-    .split('\n')
-    .map(line =>
-      line
-        .replace(/^\s*(?:>\s*)+/, '')
-        .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/, '')
-        .replace(/^\s*#+\s*/, '')
-        .trim(),
-    )
-    .filter(line => line !== '')
-
-  return oneLine(lines[0] ?? text, max)
-}
-
 const isOpen = (todo: StackedTodo) => todo.status !== 'completed'
 const isDropped = (todo: StackedTodo) => todo.source === 'todo' && todo.isListed === false && isOpen(todo)
-const allTodos = (value: TodoStack) => value.groups.flatMap(group => group.todos)
 
 function mapTodos(value: TodoStack, fn: (todo: StackedTodo) => StackedTodo | null): TodoStack {
   return {
     ...value,
-    groups: value.groups.map(group => ({
-      ...group,
-      todos: group.todos.flatMap(todo => {
-        const kept = fn(todo)
+    todos: value.todos.flatMap(todo => {
+      const kept = fn(todo)
 
-        return kept === null ? [] : [kept]
-      }),
-    })),
+      return kept === null ? [] : [kept]
+    }),
   }
 }
 
-function addTodo(value: TodoStack, groupId: string, todo: StackedTodo): TodoStack {
-  return {
-    ...value,
-    groups: value.groups.map(group =>
-      group.id === groupId ? { ...group, todos: [...group.todos, todo] } : group,
-    ),
-  }
+// New todos go on top of the stack; several made at once keep their order.
+function push(value: TodoStack, added: readonly StackedTodo[]): TodoStack {
+  return tidy({ ...value, todos: [...added, ...value.todos] })
 }
 
-// The person's own group stays on top; every request's group goes under it.
-function pushGroup(groups: TodoGroup[], group: TodoGroup): TodoGroup[] {
-  const [first, ...rest] = groups
-
-  return first?.id === MANUAL ? [first, group, ...rest] : [group, ...groups]
-}
-
-// Empty groups go; past MAX_GROUPS the oldest finished group goes first, so an
-// unfinished todo is the last thing the stack forgets.
+// Past MAX_TODOS the lowest finished todo goes first, so an unfinished todo
+// is the last thing the stack forgets.
 function tidy(value: TodoStack): TodoStack {
-  let groups = value.groups.filter(group => group.todos.length > 0)
-  while (groups.length > MAX_GROUPS) {
-    const finished = groups.map(group => group.todos.some(isOpen)).lastIndexOf(false)
-    const drop = finished === -1 ? groups.length - 1 : finished
-    groups = groups.filter((_, index) => index !== drop)
+  let todos = value.todos
+  while (todos.length > MAX_TODOS) {
+    const finished = todos.map(isOpen).lastIndexOf(false)
+    const drop = finished === -1 ? todos.length - 1 : finished
+    todos = todos.filter((_, index) => index !== drop)
   }
 
-  return { ...value, groups }
-}
-
-// The group of the request in progress, made on its first todo.
-function withGroup(value: TodoStack): [TodoStack, string] {
-  const groupId = value.request?.groupId
-  if (groupId !== undefined && value.groups.some(group => group.id === groupId)) {
-    return [value, groupId]
-  }
-
-  const id = newId()
-  const request = value.request?.text ?? '(요청 없이 생긴 할 일)'
-  const groups = pushGroup(value.groups, { id, request, todos: [] })
-
-  return [{ ...value, groups, request: { text: request, groupId: id } }, id]
+  return todos === value.todos ? value : { ...value, todos }
 }
 
 // TodoWrite hands over the model's whole list each time: an item it still
-// holds is updated in place, a new one is stacked under the current request,
-// and an unfinished one it no longer holds stays, marked as dropped.
+// holds is updated in place, a new one is pushed on top, and an unfinished
+// one it no longer holds stays, marked as dropped.
 function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[]): TodoStack {
   const items = list.map(item => ({ text: oneLine(item.content, MAX_TEXT), status: item.status }))
   const texts = items.map(item => item.text)
   let next: TodoStack = { ...value, muted: value.muted.filter(text => texts.includes(text)) }
   const matched = new Set<string>()
+  const added: StackedTodo[] = []
 
   for (const item of items) {
     if (next.muted.includes(item.text)) continue
 
-    const pool = allTodos(next).filter(
+    const pool = next.todos.filter(
       todo => todo.source === 'todo' && todo.text === item.text && !matched.has(todo.id),
     )
     const found = pool.find(todo => todo.isListed === true) ?? pool.find(isOpen)
@@ -158,26 +102,16 @@ function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[]): TodoStack
       continue
     }
 
-    const [grouped, groupId] = withGroup(next)
     const id = newId()
     matched.add(id)
-    next = addTodo(grouped, groupId, {
-      id,
-      text: item.text,
-      status: item.status,
-      source: 'todo',
-      modelStatus: item.status,
-      isListed: true,
-    })
+    added.push({ id, text: item.text, status: item.status, source: 'todo', modelStatus: item.status, isListed: true })
   }
 
-  return tidy(
-    mapTodos(next, todo =>
-      todo.source === 'todo' && !matched.has(todo.id) && todo.isListed !== false
-        ? { ...todo, isListed: false }
-        : todo,
-    ),
+  const marked = mapTodos(next, todo =>
+    todo.source === 'todo' && !matched.has(todo.id) && todo.isListed !== false ? { ...todo, isListed: false } : todo,
   )
+
+  return push(marked, added)
 }
 
 // Task ids start over with the task list (a /clear), so an older todo holding
@@ -189,33 +123,32 @@ function applyTaskCreate(value: TodoStack, taskId: string, subject: string): Tod
 
     return rest
   })
-  const [grouped, groupId] = withGroup(released)
 
-  return addTodo(grouped, groupId, {
-    id: newId(),
-    text: oneLine(subject, MAX_TEXT),
-    status: 'pending',
-    source: 'task',
-    modelStatus: 'pending',
-    taskId,
-  })
+  return push(released, [
+    {
+      id: newId(),
+      text: oneLine(subject, MAX_TEXT),
+      status: 'pending',
+      source: 'task',
+      modelStatus: 'pending',
+      taskId,
+    },
+  ])
 }
 
 function applyTaskUpdate(value: TodoStack, change: TaskChange): TodoStack {
-  return tidy(
-    mapTodos(value, todo => {
-      if (todo.taskId !== change.taskId) return todo
-      if (change.status === 'deleted') return null
+  return mapTodos(value, todo => {
+    if (todo.taskId !== change.taskId) return todo
+    if (change.status === 'deleted') return null
 
-      let next = todo
-      if (change.subject !== undefined) next = { ...next, text: oneLine(change.subject, MAX_TEXT) }
-      if (change.status !== undefined && change.status !== todo.modelStatus) {
-        next = { ...next, status: change.status, modelStatus: change.status }
-      }
+    let next = todo
+    if (change.subject !== undefined) next = { ...next, text: oneLine(change.subject, MAX_TEXT) }
+    if (change.status !== undefined && change.status !== todo.modelStatus) {
+      next = { ...next, status: change.status, modelStatus: change.status }
+    }
 
-      return next
-    }),
-  )
+    return next
+  })
 }
 
 // What the person removes while the model's list still holds it is muted, so
@@ -233,46 +166,40 @@ function toggle(value: TodoStack, id: string): TodoStack {
 }
 
 function remove(value: TodoStack, id: string): TodoStack {
-  const removed = allTodos(value).filter(todo => todo.id === id)
+  const removed = value.todos.filter(todo => todo.id === id)
 
-  return tidy({ ...mapTodos(value, todo => (todo.id === id ? null : todo)), muted: mutedBy(value, removed) })
-}
-
-function removeGroup(value: TodoStack, groupId: string): TodoStack {
-  const removed = value.groups.find(group => group.id === groupId)?.todos ?? []
-
-  return {
-    ...value,
-    groups: value.groups.filter(group => group.id !== groupId),
-    muted: mutedBy(value, removed),
-  }
+  return { ...mapTodos(value, todo => (todo.id === id ? null : todo)), muted: mutedBy(value, removed) }
 }
 
 function clearDone(value: TodoStack): TodoStack {
-  const removed = allTodos(value).filter(todo => !isOpen(todo))
+  const removed = value.todos.filter(todo => !isOpen(todo))
 
-  return tidy({ ...mapTodos(value, todo => (isOpen(todo) ? todo : null)), muted: mutedBy(value, removed) })
+  return { ...mapTodos(value, todo => (isOpen(todo) ? todo : null)), muted: mutedBy(value, removed) }
 }
 
 function clearAll(value: TodoStack): TodoStack {
-  return { groups: [], request: null, muted: mutedBy(value, allTodos(value)) }
+  return { todos: [], muted: mutedBy(value, value.todos) }
 }
 
 function addManual(value: TodoStack, text: string): TodoStack {
-  const todo: StackedTodo = { id: newId(), text, status: 'pending', source: 'manual' }
-  const hasManual = value.groups.some(group => group.id === MANUAL)
-  const groups = hasManual
-    ? value.groups
-    : [{ id: MANUAL, request: '직접 추가한 할 일', todos: [] }, ...value.groups]
-
-  return addTodo({ ...value, groups }, MANUAL, todo)
+  return push(value, [{ id: newId(), text, status: 'pending', source: 'manual' }])
 }
 
-function isStack(saved: unknown): saved is TodoStack {
-  if (typeof saved !== 'object' || saved === null) return false
-  const { groups, muted } = saved as Record<string, unknown>
+// A stack as stored or held: this version's, or an older one's that kept a
+// group per request (newest group first, a group's todos in their order).
+function toStack(saved: unknown): TodoStack | undefined {
+  if (typeof saved !== 'object' || saved === null) return undefined
+  const { todos, groups, muted } = saved as Record<string, unknown>
+  if (!Array.isArray(muted)) return undefined
+  if (Array.isArray(todos)) return { todos: todos as StackedTodo[], muted: muted as string[] }
+  if (!Array.isArray(groups)) return undefined
 
-  return Array.isArray(groups) && Array.isArray(muted)
+  return {
+    todos: (groups as { todos?: unknown }[]).flatMap(group =>
+      Array.isArray(group.todos) ? (group.todos as StackedTodo[]) : [],
+    ),
+    muted: muted as string[],
+  }
 }
 
 function taskIdOf(result: unknown): string | undefined {
@@ -283,7 +210,7 @@ function taskIdOf(result: unknown): string | undefined {
 }
 
 function openList(value: TodoStack, label: (status: TodoStatus) => string): string {
-  return allTodos(value)
+  return value.todos
     .filter(isOpen)
     .map(todo => `- [${label(todo.status)}] ${todo.text}`)
     .join('\n')
@@ -305,14 +232,17 @@ async function persist($: EngineInterface, value: TodoStack) {
   await $.store.set('sessions', kept.slice(-MAX_SESSIONS))
 }
 
+async function current($: EngineInterface): Promise<TodoStack> {
+  return toStack((await $.state.get(stackRef)).value) ?? EMPTY
+}
+
 async function change($: EngineInterface, fn: (value: TodoStack) => TodoStack) {
-  const value = await update($, stack, fn)
+  const value = await update($, stack, held => fn(toStack(held) ?? EMPTY))
   await persist($, value).catch(() => undefined)
 }
 
 async function fillPrompt($: EngineInterface) {
-  const value = (await $.state.get(stackRef)).value ?? EMPTY
-  const list = openList(value, status => STATUS_LABEL[status])
+  const list = openList(await current($), status => STATUS_LABEL[status])
   if (list === '') return
 
   await $.prompt.fill({
@@ -331,8 +261,8 @@ export const register: Register = on => {
 
     const held = await $.state.get(stackRef)
     if (held.version === 0) {
-      const saved = await $.store.get(`stack:${await $.session.id()}`)
-      if (isStack(saved)) await $.state.set(stackRef, saved)
+      const saved = toStack(await $.store.get(`stack:${await $.session.id()}`))
+      if (saved !== undefined) await $.state.set(stackRef, saved)
     }
 
     return next(e)
@@ -347,20 +277,6 @@ export const register: Register = on => {
 
     return { text: opened.isPlaced ? said : `${said} (패널을 열지 못했습니다: ${opened.reason})` }
   })
-
-  on('prompt.submit', async ($, e, next) => {
-    const isRequest =
-      e.command === undefined &&
-      e.isMeta !== true &&
-      PERSONAL_ORIGINS.includes(e.origin.kind) &&
-      e.text.trim() !== ''
-    if (isRequest) {
-      const text = titleOf(e.text, 140)
-      await change($, value => ({ ...value, request: { text } })).catch(() => undefined)
-    }
-
-    return next(e)
-  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
     const ran = await next(e)
@@ -408,8 +324,7 @@ export const register: Register = on => {
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
 
-    const value = (await $.state.get(stackRef)).value ?? EMPTY
-    const list = openList(value, status => status)
+    const list = openList(await current($), status => status)
     if (list === '') return next(e)
 
     const note =
@@ -429,21 +344,17 @@ export const register: Register = on => {
     const { Box, Text, Button } = table
     const Input = 'Input' in table ? table.Input : undefined
 
-    const value = await read($, stack)
+    const value = toStack(await read($, stack)) ?? EMPTY
     const isHiding = await read($, hideDone)
     const isConfirming = await read($, isConfirmingClear)
     const isFolded = await read($, isCollapsed)
 
-    const todos = allTodos(value)
+    const todos = value.todos
     const open = todos.filter(isOpen).length
     const working = todos.filter(todo => todo.status === 'in_progress').length
     const dropped = todos.filter(isDropped).length
     const done = todos.length - open
-
-    const shown = value.groups
-      .map(group => ({ group, todos: isHiding ? group.todos.filter(isOpen) : group.todos }))
-      .filter(entry => entry.todos.length > 0)
-    const hidden = value.groups.length - shown.length
+    const shown = isHiding ? todos.filter(isOpen) : todos
 
     // Where a pointer can hover, a ✕ shows only while it is over its row (the
     // keyed Box around it).
@@ -456,7 +367,6 @@ export const register: Register = on => {
       ) : (
         control
       )
-    const folded = await read($, folds)
 
     // The mark is the checkbox; the text is plain text beside it, so it wraps
     // instead of being cut to one line inside a button.
@@ -486,51 +396,6 @@ export const register: Register = on => {
           </Box>
           {onHover(
             <Button key={`x-${todo.id}`} plain dimColor label="✕" onPress={() => change($, v => remove(v, todo.id))} />,
-          )}
-        </Box>
-      )
-    }
-
-    const section = ({ group, todos: visible }: { group: TodoGroup; todos: StackedTodo[] }) => {
-      const finished = group.todos.filter(todo => !isOpen(todo)).length
-      const isGroupFolded = folded[group.id] ?? finished === group.todos.length
-      const ordered = visible
-        .map((todo, index) => ({ todo, index }))
-        .sort((a, b) => STATUS_ORDER[a.todo.status] - STATUS_ORDER[b.todo.status] || a.index - b.index)
-        .map(({ todo }) => todo)
-
-      return (
-        <Box key={`s-${group.id}`} flexDirection="column" gap="xs">
-          <Box key={`g-${group.id}`} flexDirection="row" gap={1} alignItems="flex-start">
-            <Button
-              key={`gf-${group.id}`}
-              plain
-              dimColor
-              label={isGroupFolded ? '▸' : '▾'}
-              onPress={() => update($, folds, all => ({ ...all, [group.id]: !isGroupFolded }))}
-            />
-            <Box flexGrow={1} flexShrink={1}>
-              <Text weight="semibold" wrap="wrap">
-                {titleOf(group.request, TITLE_MAX)}
-              </Text>
-            </Box>
-            <Text dimColor size="footnote" tabular>
-              {`${finished}/${group.todos.length}`}
-            </Text>
-            {onHover(
-              <Button
-                key={`gx-${group.id}`}
-                plain
-                dimColor
-                label="✕"
-                onPress={() => change($, v => removeGroup(v, group.id))}
-              />,
-            )}
-          </Box>
-          {!isGroupFolded && (
-            <Box flexDirection="column" gap="xs" paddingLeft={2}>
-              {ordered.map(row)}
-            </Box>
           )}
         </Box>
       )
@@ -583,13 +448,15 @@ export const register: Register = on => {
         {shown.length === 0 ? (
           <Text dimColor wrap="wrap">
             {todos.length === 0
-              ? '아직 쌓인 할 일이 없습니다. 작업을 요청하면 모델이 만든 할 일이 요청별로 여기에 쌓입니다.'
+              ? '아직 쌓인 할 일이 없습니다. 작업을 요청하면 모델이 만든 할 일이 여기에 위로 쌓입니다.'
               : '남은 할 일이 없습니다.'}
           </Text>
         ) : (
-          shown.map(section)
+          <Box flexDirection="column" gap="xs">
+            {shown.map(row)}
+          </Box>
         )}
-        {isHiding && hidden > 0 && <Text dimColor>{`완료된 요청 ${hidden}개 숨김`}</Text>}
+        {isHiding && done > 0 && <Text dimColor>{`완료된 할 일 ${done}개 숨김`}</Text>}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {open > 0 && (
             <Button key="fill" variant="primary" label="남은 할 일 프롬프트에 넣기" onPress={() => fillPrompt($)} />
