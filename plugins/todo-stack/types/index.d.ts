@@ -14,19 +14,9 @@ export type StackedTodo = {
   isListed?: boolean
 }
 
-export type TodoGroup = {
-  id: string
-  request: string
-  todos: StackedTodo[]
-}
-
-export type TodoRequest = { text: string; groupId?: string }
-
 export type TodoStack = {
-  // Newest request first.
-  groups: TodoGroup[]
-  // The request the next model todo belongs to.
-  request: TodoRequest | null
+  // The top of the stack first: newer todos above older ones.
+  todos: StackedTodo[]
   // TodoWrite texts the person removed, ignored until the model's list drops them.
   muted: string[]
 }
@@ -39,9 +29,6 @@ declare module 'claude-code' {
       isConfirmingClear: boolean
       // The person folded the card to its header.
       isCollapsed: boolean
-      // Groups the person folded (true) or unfolded (false); a group not named
-      // here is folded once all its todos are done.
-      folds: Record<string, boolean>
     }
   }
 }

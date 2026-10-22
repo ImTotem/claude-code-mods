@@ -1,4 +1,4 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, test } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
@@ -22,11 +22,23 @@ type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' }
 // What the engine answers beneath the plugin: the session, the prompt, the
 // tools, the pane's own drawing (nothing), and what a compaction was told.
 function engine(on: On, stored: Record<string, unknown> = {}) {
-  mock.store(on, stored)
+  // The plugin's store, kept here so a test can read what was saved.
+  const store = new Map(Object.entries(stored))
+  on('store.get', ($, e) => ({ value: store.get(e.key) }))
+  on('store.set', ($, e) => {
+    store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
   const seen = {
     instructions: undefined as string | undefined,
     filled: undefined as string | undefined,
     opens: [] as string[],
+    store,
   }
   let tasks = 0
   on('session.id', () => ({ value: 'session-1' }))
@@ -66,8 +78,12 @@ async function ask($: Engine, text: string) {
   await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
 }
 
-// Request titles are drawn as their own Text, so they are found by name.
-const titles = (...names: string[]) => new RegExp(`^(${names.join('|')})$`)
+// The todo texts drawn, top of the stack first.
+async function rowsOf(ui: { findAll(query: { type: 'Text'; text: RegExp }): Promise<{ text?: string }[]> }, ...names: string[]) {
+  const found = await ui.findAll({ type: 'Text', text: new RegExp(`^(${names.join('|')})$`) })
+
+  return found.map(text => text.text)
+}
 
 type Drawn = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
 
@@ -91,7 +107,7 @@ async function todoWrite($: Engine, todos: Todo[]) {
   })
 }
 
-test('each request stacks its todos, newest on top', async ($, on) => {
+test('new todos go on top of the stack, a list made at once keeping its order', async ($, on) => {
   engine(on)
   await ask($, '로그인 버그 고쳐줘')
   await todoWrite($, [
@@ -99,14 +115,28 @@ test('each request stacks its todos, newest on top', async ($, on) => {
     { content: '세션 쿠키 수정', status: 'pending' },
   ])
   await ask($, '문서도 갱신해줘')
-  await todoWrite($, [{ content: 'README 갱신', status: 'pending' }])
+  await todoWrite($, [
+    { content: '폼 검증 추가', status: 'completed' },
+    { content: '세션 쿠키 수정', status: 'in_progress' },
+    { content: 'README 갱신', status: 'pending' },
+  ])
+  await $.tool.call({ tool: 'TaskCreate', subject: '릴리스 노트', description: '...' })
+  await $.command.run({
+    command: 'todo-stack',
+    args: '배포 확인',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
 
+  const names = ['배포 확인', '릴리스 노트', 'README 갱신', '폼 검증 추가', '세션 쿠키 수정']
   for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const headers = await ui.findAll({ type: 'Text', text: titles('문서도 갱신해줘', '로그인 버그 고쳐줘') })
-    expect(headers.map(header => header.text)).toEqual(['문서도 갱신해줘', '로그인 버그 고쳐줘'])
-    expect(await ui.find({ type: 'Text', text: '남은 3 · 진행 중 1 · 완료 0' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '세션 쿠키 수정' })).toBeDefined()
+    expect(await rowsOf(ui, ...names)).toEqual(names)
+    expect(await ui.find({ type: 'Text', text: '남은 4 · 진행 중 1 · 완료 1' })).toBeDefined()
+    // No request is drawn: the card holds the todos alone.
+    expect(await ui.find({ type: 'Text', text: /고쳐줘|갱신해줘/ })).toBeUndefined()
+    const texts = await ui.findAll({ type: 'Text', text: /^(배포 확인|README 갱신)$/ })
+    expect(texts.map(text => text.props.wrap)).toEqual(['wrap', 'wrap'])
     await ui.unmount()
   }
 })
@@ -171,15 +201,9 @@ test('Task tools stack and update by task id', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '남은 0 · 진행 중 0 · 완료 1' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '1/1' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '통합 테스트' })).toBeUndefined()
-
-  // A request whose todos are all done starts folded; its arrow opens it.
-  expect(await ui.find({ type: 'Text', text: '유닛 테스트' })).toBeUndefined()
-  const [arrow] = (await ui.findAll({ type: 'Button' })).filter(button => String(button.key).startsWith('gf-'))
-  await ui.press({ key: String(arrow?.key) })
   expect(await ui.find({ type: 'Text', text: '☑' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '유닛 테스트' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '통합 테스트' })).toBeUndefined()
 })
 
 test('a compaction is told to keep the open todos, and the button fills the prompt', async ($, on) => {
@@ -202,8 +226,11 @@ test('a compaction is told to keep the open todos, and the button fills the prom
   expect(seen.instructions).not.toContain('이름 정리')
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const headers = await ui.findAll({ type: 'Text', text: titles('직접 추가한 할 일', '리팩터링') })
-  expect(headers.map(header => header.text)).toEqual(['직접 추가한 할 일', '리팩터링'])
+  expect(await rowsOf(ui, '배포 전에 로그 확인', '함수 분리', '이름 정리')).toEqual([
+    '배포 전에 로그 확인',
+    '함수 분리',
+    '이름 정리',
+  ])
 
   await ui.press({ key: 'fill' })
   expect(seen.filled).toBe(
@@ -213,48 +240,47 @@ test('a compaction is told to keep the open todos, and the button fills the prom
 
 test('a resumed session reads its stack back from the store', async ($, on) => {
   const saved = {
-    groups: [
-      {
-        id: 'g1',
-        request: '어제 하던 일',
-        todos: [{ id: 't1', text: '남은 일', status: 'pending', source: 'todo', isListed: true }],
-      },
+    todos: [
+      { id: 't2', text: '위에 있는 일', status: 'pending', source: 'manual' },
+      { id: 't1', text: '남은 일', status: 'pending', source: 'todo', isListed: true },
     ],
-    request: null,
     muted: [],
   }
   engine(on, { 'stack:session-1': saved, sessions: ['session-1'] })
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: '어제 하던 일' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '남은 일' })).toBeDefined()
+  expect(await rowsOf(ui, '위에 있는 일', '남은 일')).toEqual(['위에 있는 일', '남은 일'])
 })
 
-test('a request is titled by its first line, without quoting or comment marks', async ($, on) => {
-  engine(on)
-  await ask($, '<!-- reply 3 -->\n> - 기술 참고: 아래 로그를 보고 원인을 찾아줘\n> 두 번째 줄은 제목에 들어가지 않음')
-  await todoWrite($, [{ content: '로그 읽기', status: 'pending' }])
+test("a stack saved by the version that grouped todos per request reads as one stack", async ($, on) => {
+  const saved = {
+    groups: [
+      { id: 'g2', request: '오늘 요청', todos: [{ id: 't3', text: '새 일', status: 'pending', source: 'todo', isListed: true }] },
+      {
+        id: 'g1',
+        request: '어제 하던 일',
+        todos: [
+          { id: 't1', text: '첫 일', status: 'completed', source: 'todo', isListed: true },
+          { id: 't2', text: '둘째 일', status: 'pending', source: 'todo', isListed: true },
+        ],
+      },
+    ],
+    request: { text: '오늘 요청', groupId: 'g2' },
+    muted: [],
+  }
+  const seen = engine(on, { 'stack:session-1': saved, sessions: ['session-1'] })
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: '기술 참고: 아래 로그를 보고 원인을 찾아줘' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /reply 3|두 번째 줄/ })).toBeUndefined()
-})
+  expect(await rowsOf(ui, '새 일', '첫 일', '둘째 일')).toEqual(['새 일', '첫 일', '둘째 일'])
+  expect(await ui.find({ type: 'Text', text: /오늘 요청|어제 하던 일/ })).toBeUndefined()
 
-test('open todos come first, and a row is wrapped text beside its mark', async ($, on) => {
-  engine(on)
-  await ask($, '정렬')
-  await todoWrite($, [
-    { content: '끝난 일', status: 'completed' },
-    { content: '기다리는 일', status: 'pending' },
-    { content: '하는 중인 일', status: 'in_progress' },
-  ])
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const rows = await ui.findAll({ type: 'Text', text: /^(끝난|기다리는|하는 중인) 일$/ })
-  expect(rows.map(row => row.text)).toEqual(['하는 중인 일', '기다리는 일', '끝난 일'])
-  expect(rows.map(row => row.props.wrap)).toEqual(['wrap', 'wrap', 'wrap'])
-  expect((await ui.findAll({ type: 'Text', text: /^[◐☐☑]$/ })).map(mark => mark.text)).toEqual(['◐', '☐', '☑'])
+  // The next change saves it in this version's shape.
+  await todoWrite($, [{ content: '새 일', status: 'completed' }])
+  const stored = seen.store.get('stack:session-1') as { todos?: { text: string }[]; groups?: unknown }
+  expect(stored.groups).toBeUndefined()
+  expect(stored.todos?.map(todo => todo.text)).toEqual(['새 일', '첫 일', '둘째 일'])
 })
 
 test('a row shows its ✕ under the pointer where there is one, and always elsewhere', async ($, on) => {
