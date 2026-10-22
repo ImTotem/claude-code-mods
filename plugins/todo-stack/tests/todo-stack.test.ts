@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
@@ -19,8 +19,9 @@ const PANE = {
 
 type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' }
 
-// What the engine answers beneath the plugin: the session, the prompt, the
-// tools, the pane's own drawing (nothing), and what a compaction was told.
+// What the engine answers beneath the plugin: the session, the clock, the
+// store, the prompt, the tools, the pane's own drawing (nothing), and what a
+// compaction was told.
 function engine(on: On, stored: Record<string, unknown> = {}) {
   // The plugin's store, kept here so a test can read what was saved.
   const store = new Map(Object.entries(stored))
@@ -39,9 +40,12 @@ function engine(on: On, stored: Record<string, unknown> = {}) {
     filled: undefined as string | undefined,
     opens: [] as string[],
     store,
+    clock: mock.clock(on),
+    // The session the next call comes from; another session shares the store.
+    sessionId: 'session-1',
   }
   let tasks = 0
-  on('session.id', () => ({ value: 'session-1' }))
+  on('session.id', () => ({ value: seen.sessionId }))
   on('ui.render', { component: 'Pane' }, ($, e) => {
     const { Box } = $.ui.resolve(e)
     return h(Box, { key: 'bottom' }) as RenderElement
@@ -238,23 +242,79 @@ test('a compaction is told to keep the open todos, and the button fills the prom
   )
 })
 
-test('a resumed session reads its stack back from the store', async ($, on) => {
+test('every session shares one stack, read from the store', async ($, on) => {
   const saved = {
     todos: [
-      { id: 't2', text: '위에 있는 일', status: 'pending', source: 'manual' },
-      { id: 't1', text: '남은 일', status: 'pending', source: 'todo', isListed: true },
+      { id: 't2', text: '위에 있는 일', status: 'pending', source: 'manual', sessionId: 'session-0' },
+      { id: 't1', text: '남은 일', status: 'pending', source: 'todo', sessionId: 'session-0', isListed: true },
     ],
     muted: [],
   }
-  engine(on, { 'stack:session-1': saved, sessions: ['session-1'] })
+  const seen = engine(on, { stack: saved })
+  seen.sessionId = 'session-new'
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await rowsOf(ui, '위에 있는 일', '남은 일')).toEqual(['위에 있는 일', '남은 일'])
 })
 
-test("a stack saved by the version that grouped todos per request reads as one stack", async ($, on) => {
+test('after a reload of the plugin the card reads the stack back from the store', async ($, on) => {
   const saved = {
+    todos: [{ id: 't1', text: '새로고침 전에 쌓인 일', status: 'pending', source: 'manual', sessionId: 'session-1' }],
+    muted: [],
+  }
+  const seen = engine(on, { stack: saved })
+
+  // No session.start: the plugin was reloaded into a running session.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await seen.clock.settle()
+  expect(await rowsOf(ui, '새로고침 전에 쌓인 일')).toEqual(['새로고침 전에 쌓인 일'])
+
+  // A change made now adds to that stack, not to an empty one.
+  await todoWrite($, [{ content: '새 일', status: 'pending' }])
+  expect(await rowsOf(ui, '새 일', '새로고침 전에 쌓인 일')).toEqual(['새 일', '새로고침 전에 쌓인 일'])
+  const stored = seen.store.get('stack') as { todos: { text: string }[] }
+  expect(stored.todos.map(todo => todo.text)).toEqual(['새 일', '새로고침 전에 쌓인 일'])
+})
+
+test("another session's changes are kept and shown, and its list leaves this session's todos alone", async ($, on) => {
+  const seen = engine(on)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  await todoWrite($, [{ content: '이 세션의 일', status: 'in_progress' }])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // Another session, running beside this one, writes the store.
+  const stored = seen.store.get('stack') as { todos: unknown[]; muted: unknown[] }
+  seen.store.set('stack', {
+    ...stored,
+    todos: [{ id: 'o1', text: '다른 세션의 일', status: 'pending', source: 'todo', sessionId: 'session-2', isListed: true }, ...stored.todos],
+  })
+  await seen.clock.advance(10_000)
+  expect(await rowsOf(ui, '다른 세션의 일', '이 세션의 일')).toEqual(['다른 세션의 일', '이 세션의 일'])
+
+  // This session's next list neither drops nor duplicates the other's todo.
+  await todoWrite($, [
+    { content: '이 세션의 일', status: 'completed' },
+    { content: '다음 일', status: 'pending' },
+  ])
+  expect(await rowsOf(ui, '다음 일', '다른 세션의 일', '이 세션의 일')).toEqual(['다음 일', '다른 세션의 일', '이 세션의 일'])
+  expect(await ui.findAll({ type: 'Text', text: '모델 목록에서 빠짐' })).toHaveLength(0)
+
+  // The other session's list, in turn, leaves this session's todos as they are.
+  seen.sessionId = 'session-2'
+  await todoWrite($, [{ content: '다른 세션의 일', status: 'completed' }])
+  expect(await ui.findAll({ type: 'Text', text: '모델 목록에서 빠짐' })).toHaveLength(0)
+  expect(await ui.find({ type: 'Text', text: '남은 1 · 진행 중 0 · 완료 2' })).toBeDefined()
+
+  // A compaction carries over its own session's todos only.
+  seen.sessionId = 'session-1'
+  await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: '계속', toolUses: [] }] })
+  expect(seen.instructions).toContain('- [pending] 다음 일')
+  expect(seen.instructions).not.toContain('다른 세션의 일')
+})
+
+test('the per-session stacks of older versions are merged into one, the last used on top', async ($, on) => {
+  const grouped = {
     groups: [
       { id: 'g2', request: '오늘 요청', todos: [{ id: 't3', text: '새 일', status: 'pending', source: 'todo', isListed: true }] },
       {
@@ -267,20 +327,37 @@ test("a stack saved by the version that grouped todos per request reads as one s
       },
     ],
     request: { text: '오늘 요청', groupId: 'g2' },
+    muted: ['지운 일'],
+  }
+  const flat = {
+    todos: [{ id: 't0', text: '예전 세션의 일', status: 'pending', source: 'manual' }],
     muted: [],
   }
-  const seen = engine(on, { 'stack:session-1': saved, sessions: ['session-1'] })
+  const seen = engine(on, {
+    'stack:session-0': flat,
+    'stack:session-1': grouped,
+    sessions: ['session-0', 'session-1'],
+  })
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await rowsOf(ui, '새 일', '첫 일', '둘째 일')).toEqual(['새 일', '첫 일', '둘째 일'])
+  const names = ['새 일', '첫 일', '둘째 일', '예전 세션의 일']
+  expect(await rowsOf(ui, ...names)).toEqual(names)
   expect(await ui.find({ type: 'Text', text: /오늘 요청|어제 하던 일/ })).toBeUndefined()
 
-  // The next change saves it in this version's shape.
-  await todoWrite($, [{ content: '새 일', status: 'completed' }])
-  const stored = seen.store.get('stack:session-1') as { todos?: { text: string }[]; groups?: unknown }
-  expect(stored.groups).toBeUndefined()
-  expect(stored.todos?.map(todo => todo.text)).toEqual(['새 일', '첫 일', '둘째 일'])
+  expect([...seen.store.keys()]).toEqual(['stack'])
+  const stored = seen.store.get('stack') as { todos: { text: string; sessionId: string }[]; muted: unknown[] }
+  expect(stored.todos.map(todo => [todo.text, todo.sessionId])).toEqual([
+    ['새 일', 'session-1'],
+    ['첫 일', 'session-1'],
+    ['둘째 일', 'session-1'],
+    ['예전 세션의 일', 'session-0'],
+  ])
+  expect(stored.muted).toEqual([{ sessionId: 'session-1', text: '지운 일' }])
+
+  // The session they came from still owns its model's todos.
+  await todoWrite($, [{ content: '둘째 일', status: 'completed' }])
+  expect(await ui.find({ type: 'Text', text: '남은 2 · 진행 중 0 · 완료 2' })).toBeDefined()
 })
 
 test('a row shows its ✕ under the pointer where there is one, and always elsewhere', async ($, on) => {

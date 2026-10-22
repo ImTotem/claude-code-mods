@@ -1,15 +1,22 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { StackedTodo, TodoStack, TodoStatus } from '../types'
+import type { MutedText, StackedTodo, TodoStack, TodoStatus } from '../types'
 
 // The pane session-rail opens; this mod adds its card to it, and opens it
 // too: a pane id is one pane whichever plugin opens it.
 const RAIL = 'session-rail'
 const RAIL_TITLE = '세션'
 const MAX_TODOS = 300
-const MAX_SESSIONS = 30
 const MAX_TEXT = 500
+// One stack for every session, kept in the plugin's store.
+const STORE_KEY = 'stack'
+// Versions before 0.5.0 kept a stack per session under `stack:<id>`, listed
+// oldest first under `sessions`.
+const OLD_PREFIX = 'stack:'
+const OLD_INDEX = 'sessions'
+// How often an open session reads the store again for other sessions' changes.
+const WATCH_MS = 10_000
 
 const STATUS_LABEL: Record<TodoStatus, string> = {
   pending: '대기',
@@ -39,6 +46,9 @@ function oneLine(text: string, max: number): string {
 
 const isOpen = (todo: StackedTodo) => todo.status !== 'completed'
 const isDropped = (todo: StackedTodo) => todo.source === 'todo' && todo.isListed === false && isOpen(todo)
+// The model's todos and task ids are its session's own: another session's
+// list never matches, updates or drops them.
+const isModelTodoOf = (todo: StackedTodo, sessionId: string) => todo.sessionId === sessionId
 
 function mapTodos(value: TodoStack, fn: (todo: StackedTodo) => StackedTodo | null): TodoStack {
   return {
@@ -69,21 +79,24 @@ function tidy(value: TodoStack): TodoStack {
   return todos === value.todos ? value : { ...value, todos }
 }
 
-// TodoWrite hands over the model's whole list each time: an item it still
+// TodoWrite hands over the session's whole list each time: an item it still
 // holds is updated in place, a new one is pushed on top, and an unfinished
 // one it no longer holds stays, marked as dropped.
-function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[]): TodoStack {
+function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[], sessionId: string): TodoStack {
   const items = list.map(item => ({ text: oneLine(item.content, MAX_TEXT), status: item.status }))
   const texts = items.map(item => item.text)
-  let next: TodoStack = { ...value, muted: value.muted.filter(text => texts.includes(text)) }
+  const muted = value.muted.filter(entry => entry.sessionId !== sessionId || texts.includes(entry.text))
+  const isMuted = (text: string) => muted.some(entry => entry.sessionId === sessionId && entry.text === text)
+  let next: TodoStack = { ...value, muted }
   const matched = new Set<string>()
   const added: StackedTodo[] = []
 
   for (const item of items) {
-    if (next.muted.includes(item.text)) continue
+    if (isMuted(item.text)) continue
 
     const pool = next.todos.filter(
-      todo => todo.source === 'todo' && todo.text === item.text && !matched.has(todo.id),
+      todo =>
+        todo.source === 'todo' && isModelTodoOf(todo, sessionId) && todo.text === item.text && !matched.has(todo.id),
     )
     const found = pool.find(todo => todo.isListed === true) ?? pool.find(isOpen)
 
@@ -104,11 +117,21 @@ function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[]): TodoStack
 
     const id = newId()
     matched.add(id)
-    added.push({ id, text: item.text, status: item.status, source: 'todo', modelStatus: item.status, isListed: true })
+    added.push({
+      id,
+      text: item.text,
+      status: item.status,
+      source: 'todo',
+      sessionId,
+      modelStatus: item.status,
+      isListed: true,
+    })
   }
 
   const marked = mapTodos(next, todo =>
-    todo.source === 'todo' && !matched.has(todo.id) && todo.isListed !== false ? { ...todo, isListed: false } : todo,
+    todo.source === 'todo' && isModelTodoOf(todo, sessionId) && !matched.has(todo.id) && todo.isListed !== false
+      ? { ...todo, isListed: false }
+      : todo,
   )
 
   return push(marked, added)
@@ -116,9 +139,9 @@ function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[]): TodoStack
 
 // Task ids start over with the task list (a /clear), so an older todo holding
 // the same id lets go of it.
-function applyTaskCreate(value: TodoStack, taskId: string, subject: string): TodoStack {
+function applyTaskCreate(value: TodoStack, taskId: string, subject: string, sessionId: string): TodoStack {
   const released = mapTodos(value, todo => {
-    if (todo.taskId !== taskId) return todo
+    if (todo.taskId !== taskId || !isModelTodoOf(todo, sessionId)) return todo
     const { taskId: _, ...rest } = todo
 
     return rest
@@ -130,15 +153,16 @@ function applyTaskCreate(value: TodoStack, taskId: string, subject: string): Tod
       text: oneLine(subject, MAX_TEXT),
       status: 'pending',
       source: 'task',
+      sessionId,
       modelStatus: 'pending',
       taskId,
     },
   ])
 }
 
-function applyTaskUpdate(value: TodoStack, change: TaskChange): TodoStack {
+function applyTaskUpdate(value: TodoStack, change: TaskChange, sessionId: string): TodoStack {
   return mapTodos(value, todo => {
-    if (todo.taskId !== change.taskId) return todo
+    if (todo.taskId !== change.taskId || !isModelTodoOf(todo, sessionId)) return todo
     if (change.status === 'deleted') return null
 
     let next = todo
@@ -152,11 +176,20 @@ function applyTaskUpdate(value: TodoStack, change: TaskChange): TodoStack {
 }
 
 // What the person removes while the model's list still holds it is muted, so
-// the model's next TodoWrite does not stack it again.
-function mutedBy(value: TodoStack, removed: readonly StackedTodo[]): string[] {
-  const texts = removed.filter(todo => todo.source === 'todo' && todo.isListed === true).map(todo => todo.text)
+// that session's next TodoWrite does not stack it again.
+function mutedBy(value: TodoStack, removed: readonly StackedTodo[]): MutedText[] {
+  const added = removed.flatMap(todo =>
+    todo.source === 'todo' && todo.isListed === true && todo.sessionId !== undefined
+      ? [{ sessionId: todo.sessionId, text: todo.text }]
+      : [],
+  )
+  const fresh = added.filter(
+    (entry, index) =>
+      !value.muted.some(old => old.sessionId === entry.sessionId && old.text === entry.text) &&
+      added.findIndex(other => other.sessionId === entry.sessionId && other.text === entry.text) === index,
+  )
 
-  return [...new Set([...value.muted, ...texts])]
+  return [...value.muted, ...fresh]
 }
 
 function toggle(value: TodoStack, id: string): TodoStack {
@@ -181,24 +214,39 @@ function clearAll(value: TodoStack): TodoStack {
   return { todos: [], muted: mutedBy(value, value.todos) }
 }
 
-function addManual(value: TodoStack, text: string): TodoStack {
-  return push(value, [{ id: newId(), text, status: 'pending', source: 'manual' }])
+function addManual(value: TodoStack, text: string, sessionId: string): TodoStack {
+  return push(value, [{ id: newId(), text, status: 'pending', source: 'manual', sessionId }])
 }
 
-// A stack as stored or held: this version's, or an older one's that kept a
-// group per request (newest group first, a group's todos in their order).
-function toStack(saved: unknown): TodoStack | undefined {
+// A stack as stored or held: this version's; 0.4's, a flat stack of one
+// session's; or an older one's that kept a group per request (newest group
+// first, a group's todos in their order). Todos and muted texts without a
+// session take `sessionId`, the session an older version kept them for.
+function toStack(saved: unknown, sessionId?: string): TodoStack | undefined {
   if (typeof saved !== 'object' || saved === null) return undefined
   const { todos, groups, muted } = saved as Record<string, unknown>
   if (!Array.isArray(muted)) return undefined
-  if (Array.isArray(todos)) return { todos: todos as StackedTodo[], muted: muted as string[] }
-  if (!Array.isArray(groups)) return undefined
+
+  const listed = Array.isArray(todos)
+    ? (todos as StackedTodo[])
+    : Array.isArray(groups)
+      ? (groups as { todos?: unknown }[]).flatMap(group =>
+          Array.isArray(group.todos) ? (group.todos as StackedTodo[]) : [],
+        )
+      : undefined
+  if (listed === undefined) return undefined
 
   return {
-    todos: (groups as { todos?: unknown }[]).flatMap(group =>
-      Array.isArray(group.todos) ? (group.todos as StackedTodo[]) : [],
+    todos: listed.map(todo =>
+      todo.sessionId !== undefined || sessionId === undefined ? todo : { ...todo, sessionId },
     ),
-    muted: muted as string[],
+    muted: (muted as unknown[]).flatMap((entry): MutedText[] => {
+      if (typeof entry === 'string') return sessionId === undefined ? [] : [{ sessionId, text: entry }]
+      if (typeof entry !== 'object' || entry === null) return []
+      const { sessionId: owner, text } = entry as Record<string, unknown>
+
+      return typeof owner === 'string' && typeof text === 'string' ? [{ sessionId: owner, text }] : []
+    }),
   }
 }
 
@@ -209,40 +257,88 @@ function taskIdOf(result: unknown): string | undefined {
   return typeof id === 'string' || typeof id === 'number' ? String(id) : undefined
 }
 
-function openList(value: TodoStack, label: (status: TodoStatus) => string): string {
-  return value.todos
+function openList(todos: readonly StackedTodo[], label: (status: TodoStatus) => string): string {
+  return todos
     .filter(isOpen)
     .map(todo => `- [${label(todo.status)}] ${todo.text}`)
     .join('\n')
 }
 
-// Kept in the plugin's store per session, so a resumed session finds its stack.
-async function persist($: EngineInterface, value: TodoStack) {
-  const sessionId = await $.session.id()
-  await $.store.set(`stack:${sessionId}`, value)
+// The per-session stacks older versions kept, merged into one: the session
+// used last on top. The old keys go once the merged stack is saved.
+async function migrate($: EngineInterface): Promise<TodoStack> {
+  const keys = (await $.store.keys()).filter(key => key.startsWith(OLD_PREFIX))
+  const ids = keys.map(key => key.slice(OLD_PREFIX.length))
+  const index = await $.store.get(OLD_INDEX)
+  const order = Array.isArray(index) ? index.filter((id): id is string => typeof id === 'string') : []
+  const oldestFirst = [...ids.filter(id => !order.includes(id)), ...order.filter(id => ids.includes(id))]
 
-  const index = await $.store.get('sessions')
-  const ids = Array.isArray(index) ? index.filter((id): id is string => typeof id === 'string') : []
-  if (ids[ids.length - 1] === sessionId) return
-
-  const kept = [...ids.filter(id => id !== sessionId), sessionId]
-  for (const old of kept.slice(0, Math.max(0, kept.length - MAX_SESSIONS))) {
-    await $.store.delete(`stack:${old}`)
+  let merged = EMPTY
+  for (const id of oldestFirst) {
+    const old = toStack(await $.store.get(`${OLD_PREFIX}${id}`), id)
+    if (old !== undefined) merged = { todos: [...old.todos, ...merged.todos], muted: [...merged.muted, ...old.muted] }
   }
-  await $.store.set('sessions', kept.slice(-MAX_SESSIONS))
+  merged = tidy(merged)
+
+  await $.store.set(STORE_KEY, merged)
+  for (const key of keys) await $.store.delete(key)
+  if (index !== undefined) await $.store.delete(OLD_INDEX)
+
+  return merged
 }
 
-async function current($: EngineInterface): Promise<TodoStack> {
-  return toStack((await $.state.get(stackRef)).value) ?? EMPTY
+// The store holds the stack; what a session holds in state is a copy of it.
+async function load($: EngineInterface): Promise<TodoStack> {
+  return toStack(await $.store.get(STORE_KEY)) ?? migrate($)
 }
 
-async function change($: EngineInterface, fn: (value: TodoStack) => TodoStack) {
-  const value = await update($, stack, held => fn(toStack(held) ?? EMPTY))
-  await persist($, value).catch(() => undefined)
+async function hold($: EngineInterface, value: TodoStack) {
+  const held = await $.state.get(stackRef)
+  if (held.version === 0 || JSON.stringify(held.value) !== JSON.stringify(value)) {
+    await $.state.set(stackRef, value)
+  }
+}
+
+// Changes run one at a time, each on what the store holds then, so a change
+// made in another session meanwhile is kept, not written over.
+let queue: Promise<unknown> = Promise.resolve()
+
+function serially<T>(run: () => Promise<T>): Promise<T> {
+  const done = queue.then(run)
+  queue = done.catch(() => undefined)
+
+  return done
+}
+
+function refresh($: EngineInterface): Promise<void> {
+  return serially(async () => hold($, await load($)))
+}
+
+function change($: EngineInterface, fn: (value: TodoStack, sessionId: string) => TodoStack): Promise<void> {
+  return serially(async () => {
+    const sessionId = await $.session.id()
+    const value = fn(await load($), sessionId)
+    await $.store.set(STORE_KEY, value)
+    await hold($, value)
+  })
+}
+
+// Another session's changes reach the store, not this session's state: an
+// open session reads the store again now and then. Started once per load of
+// this module, so a reload starts it again.
+let isWatching = false
+
+function watch($: EngineInterface) {
+  if (isWatching) return
+  isWatching = true
+  $.clock.every(WATCH_MS, () => {
+    void refresh($).catch(() => undefined)
+  })
 }
 
 async function fillPrompt($: EngineInterface) {
-  const list = openList(await current($), status => STATUS_LABEL[status])
+  const value = await serially(() => load($))
+  const list = openList(value.todos, status => STATUS_LABEL[status])
   if (list === '') return
 
   await $.prompt.fill({
@@ -259,18 +355,15 @@ export const register: Register = on => {
       argumentHint: '[추가할 할 일]',
     })
 
-    const held = await $.state.get(stackRef)
-    if (held.version === 0) {
-      const saved = toStack(await $.store.get(`stack:${await $.session.id()}`))
-      if (saved !== undefined) await $.state.set(stackRef, saved)
-    }
+    await refresh($).catch(() => undefined)
+    watch($)
 
     return next(e)
   })
 
   on('command.run', { command: 'todo-stack' }, async ($, e) => {
     const text = oneLine(e.args, MAX_TEXT)
-    if (text !== '') await change($, value => addManual(value, text))
+    if (text !== '') await change($, (value, sessionId) => addManual(value, text, sessionId))
 
     const opened = await $.ui.open({ id: RAIL, title: RAIL_TITLE })
     const said = text === '' ? '할 일 스택을 열었습니다.' : `할 일을 추가했습니다: ${text}`
@@ -285,7 +378,7 @@ export const register: Register = on => {
     }
 
     const list = e.todos
-    await change($, value => applyTodoWrite(value, list)).catch(() => undefined)
+    await change($, (value, sessionId) => applyTodoWrite(value, list, sessionId)).catch(() => undefined)
 
     return ran
   }).catch(($, e, next) => next(e))
@@ -299,7 +392,9 @@ export const register: Register = on => {
     const taskId = taskIdOf(ran.result)
     const subject = e.subject
     if (taskId !== undefined) {
-      await change($, value => applyTaskCreate(value, taskId, subject)).catch(() => undefined)
+      await change($, (value, sessionId) => applyTaskCreate(value, taskId, subject, sessionId)).catch(
+        () => undefined,
+      )
     }
 
     return ran
@@ -314,17 +409,30 @@ export const register: Register = on => {
     const taskChange: TaskChange = { taskId: e.taskId }
     if (e.subject !== undefined) taskChange.subject = e.subject
     if (e.status !== undefined) taskChange.status = e.status
-    await change($, value => applyTaskUpdate(value, taskChange)).catch(() => undefined)
+    await change($, (value, sessionId) => applyTaskUpdate(value, taskChange, sessionId)).catch(() => undefined)
 
     return ran
   }).catch(($, e, next) => next(e))
 
+  // The pane opening shows the stack as the store holds it now.
+  on('ui.open', { id: RAIL }, async ($, e, next) => {
+    const opened = await next(e)
+    if (opened.value?.isPlaced === true) void refresh($).catch(() => undefined)
+
+    return opened
+  }).catch(($, e, next) => next(e))
+
   // Compaction is where the model loses track: the summarizer is told to carry
-  // every unfinished todo of the stack over.
+  // this session's unfinished todos over.
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
 
-    const list = openList(await current($), status => status)
+    const sessionId = await $.session.id()
+    const value = await serially(() => load($)).catch(() => EMPTY)
+    const list = openList(
+      value.todos.filter(todo => todo.sessionId === sessionId),
+      status => status,
+    )
     if (list === '') return next(e)
 
     const note =
@@ -344,7 +452,18 @@ export const register: Register = on => {
     const { Box, Text, Button } = table
     const Input = 'Input' in table ? table.Input : undefined
 
-    const value = toStack(await read($, stack)) ?? EMPTY
+    // A reload of the plugin, or an update, starts with nothing held: this
+    // draw reads the stack from the store, and the state takes it up after
+    // the draw (a draw sees the state as it was when it began).
+    const held = await $.state.get(stackRef)
+    let value = toStack(held.value) ?? EMPTY
+    if (held.version === 0) {
+      value = await serially(() => load($)).catch(() => EMPTY)
+      $.clock.after(1, () => {
+        void refresh($).catch(() => undefined)
+      })
+    }
+    watch($)
     const isHiding = await read($, hideDone)
     const isConfirming = await read($, isConfirmingClear)
     const isFolded = await read($, isCollapsed)
@@ -441,7 +560,7 @@ export const register: Register = on => {
             submitLabel="추가"
             onSubmit={text => {
               const added = oneLine(text, MAX_TEXT)
-              if (added !== '') void change($, v => addManual(v, added))
+              if (added !== '') void change($, (v, sessionId) => addManual(v, added, sessionId))
             }}
           />
         )}
