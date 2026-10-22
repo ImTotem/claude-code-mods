@@ -66,6 +66,24 @@ async function ask($: Engine, text: string) {
   await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
 }
 
+// Request titles are drawn as their own Text, so they are found by name.
+const titles = (...names: string[]) => new RegExp(`^(${names.join('|')})$`)
+
+type Drawn = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+
+// Whether the Button keyed `key` sits in a Box drawn hidden until hovered.
+function isHoverOnly(node: unknown, key: string, isHidden = false): boolean | undefined {
+  if (typeof node !== 'object' || node === null) return undefined
+  const { type, props = {}, children = [] } = node as Drawn
+  const hidden = isHidden || (type === 'Box' && props.display === 'none')
+  if (type === 'Button' && props.key === key) return hidden
+  for (const child of children) {
+    const found = isHoverOnly(child, key, hidden)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
 async function todoWrite($: Engine, todos: Todo[]) {
   await $.tool.call({
     tool: 'TodoWrite',
@@ -85,8 +103,8 @@ test('each request stacks its todos, newest on top', async ($, on) => {
 
   for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    const headers = await ui.findAll({ type: 'Text', text: /^▸ / })
-    expect(headers.map(header => header.text)).toEqual(['▸ 문서도 갱신해줘', '▸ 로그인 버그 고쳐줘'])
+    const headers = await ui.findAll({ type: 'Text', text: titles('문서도 갱신해줘', '로그인 버그 고쳐줘') })
+    expect(headers.map(header => header.text)).toEqual(['문서도 갱신해줘', '로그인 버그 고쳐줘'])
     expect(await ui.find({ type: 'Text', text: '남은 3 · 진행 중 1 · 완료 0' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '세션 쿠키 수정' })).toBeDefined()
     await ui.unmount()
@@ -127,7 +145,9 @@ test("the person's check and removal hold against the model's next list", async 
   ])
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const [first, second] = await ui.findAll({ type: 'Button', text: /하나|둘/ })
+  const checks = (await ui.findAll({ type: 'Button' })).filter(button => String(button.key).startsWith('t-'))
+  expect(checks).toHaveLength(2)
+  const [first, second] = checks
   await ui.press({ key: String(first?.key) })
   await ui.press({ key: String(second?.key).replace(/^t-/, 'x-') })
   expect(await ui.find({ type: 'Text', text: '남은 0 · 진행 중 0 · 완료 1' })).toBeDefined()
@@ -151,8 +171,15 @@ test('Task tools stack and update by task id', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '남은 0 · 진행 중 0 · 완료 1' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '☑ ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1/1' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '통합 테스트' })).toBeUndefined()
+
+  // A request whose todos are all done starts folded; its arrow opens it.
+  expect(await ui.find({ type: 'Text', text: '유닛 테스트' })).toBeUndefined()
+  const [arrow] = (await ui.findAll({ type: 'Button' })).filter(button => String(button.key).startsWith('gf-'))
+  await ui.press({ key: String(arrow?.key) })
+  expect(await ui.find({ type: 'Text', text: '☑' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '유닛 테스트' })).toBeDefined()
 })
 
 test('a compaction is told to keep the open todos, and the button fills the prompt', async ($, on) => {
@@ -175,8 +202,8 @@ test('a compaction is told to keep the open todos, and the button fills the prom
   expect(seen.instructions).not.toContain('이름 정리')
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const headers = await ui.findAll({ type: 'Text', text: /^▸ / })
-  expect(headers.map(header => header.text)).toEqual(['▸ 직접 추가한 할 일', '▸ 리팩터링'])
+  const headers = await ui.findAll({ type: 'Text', text: titles('직접 추가한 할 일', '리팩터링') })
+  expect(headers.map(header => header.text)).toEqual(['직접 추가한 할 일', '리팩터링'])
 
   await ui.press({ key: 'fill' })
   expect(seen.filled).toBe(
@@ -200,8 +227,48 @@ test('a resumed session reads its stack back from the store', async ($, on) => {
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: '▸ 어제 하던 일' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '어제 하던 일' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '남은 일' })).toBeDefined()
+})
+
+test('a request is titled by its first line, without quoting or comment marks', async ($, on) => {
+  engine(on)
+  await ask($, '<!-- reply 3 -->\n> - 기술 참고: 아래 로그를 보고 원인을 찾아줘\n> 두 번째 줄은 제목에 들어가지 않음')
+  await todoWrite($, [{ content: '로그 읽기', status: 'pending' }])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: '기술 참고: 아래 로그를 보고 원인을 찾아줘' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /reply 3|두 번째 줄/ })).toBeUndefined()
+})
+
+test('open todos come first, and a row is wrapped text beside its mark', async ($, on) => {
+  engine(on)
+  await ask($, '정렬')
+  await todoWrite($, [
+    { content: '끝난 일', status: 'completed' },
+    { content: '기다리는 일', status: 'pending' },
+    { content: '하는 중인 일', status: 'in_progress' },
+  ])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const rows = await ui.findAll({ type: 'Text', text: /^(끝난|기다리는|하는 중인) 일$/ })
+  expect(rows.map(row => row.text)).toEqual(['하는 중인 일', '기다리는 일', '끝난 일'])
+  expect(rows.map(row => row.props.wrap)).toEqual(['wrap', 'wrap', 'wrap'])
+  expect((await ui.findAll({ type: 'Text', text: /^[◐☐☑]$/ })).map(mark => mark.text)).toEqual(['◐', '☐', '☑'])
+})
+
+test('a row shows its ✕ under the pointer where there is one, and always elsewhere', async ($, on) => {
+  engine(on)
+  await ask($, '지울 수 있는 일')
+  await todoWrite($, [{ content: '하나', status: 'pending' }])
+
+  for (const [surface, isHidden] of [['desktop', true], ['vscode', true], ['terminal', false], ['mobile', false]] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const [check] = (await ui.findAll({ type: 'Button' })).filter(button => String(button.key).startsWith('t-'))
+    const tree = await ui.drawn()
+    expect(isHoverOnly(tree, String(check?.key).replace(/^t-/, 'x-'))).toBe(isHidden)
+    await ui.unmount()
+  }
 })
 
 test('clearing everything asks first', async ($, on) => {

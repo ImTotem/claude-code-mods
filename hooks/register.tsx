@@ -26,6 +26,11 @@ const stack = atom(stackRef, EMPTY)
 const hideDone = atom({ plugin: 'todo-stack', key: 'hideDone' } as const, false)
 const isConfirmingClear = atom({ plugin: 'todo-stack', key: 'isConfirmingClear' } as const, false)
 const isCollapsed = atom({ plugin: 'todo-stack', key: 'isCollapsed' } as const, false)
+const folds = atom({ plugin: 'todo-stack', key: 'folds' } as const, {})
+
+const TITLE_MAX = 60
+// In a group, what is under way first, then what waits, then what is done.
+const STATUS_ORDER: Record<TodoStatus, number> = { in_progress: 0, pending: 1, completed: 2 }
 
 type ModelTodo = { content: string; status: TodoStatus }
 type TaskChange = { taskId: string; subject?: string; status?: TodoStatus | 'deleted' }
@@ -38,6 +43,26 @@ function oneLine(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim()
 
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
+}
+
+// A request's first readable line, with HTML comments, code blocks, quote
+// marks, list markers and headings left out, so its group reads as what was
+// asked. Stored titles (one line already) read the same way.
+function titleOf(text: string, max: number): string {
+  const lines = text
+    .replace(/<!--[\s\S]*?-->/g, '\n')
+    .replace(/```[\s\S]*?```/g, '\n')
+    .split('\n')
+    .map(line =>
+      line
+        .replace(/^\s*(?:>\s*)+/, '')
+        .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/, '')
+        .replace(/^\s*#+\s*/, '')
+        .trim(),
+    )
+    .filter(line => line !== '')
+
+  return oneLine(lines[0] ?? text, max)
 }
 
 const isOpen = (todo: StackedTodo) => todo.status !== 'completed'
@@ -330,7 +355,7 @@ export const register: Register = on => {
       PERSONAL_ORIGINS.includes(e.origin.kind) &&
       e.text.trim() !== ''
     if (isRequest) {
-      const text = oneLine(e.text, 140)
+      const text = titleOf(e.text, 140)
       await change($, value => ({ ...value, request: { text } })).catch(() => undefined)
     }
 
@@ -420,61 +445,96 @@ export const register: Register = on => {
       .filter(entry => entry.todos.length > 0)
     const hidden = value.groups.length - shown.length
 
+    // Where a pointer can hover, a ✕ shows only while it is over its row (the
+    // keyed Box around it).
+    const canHover = e.surface === 'desktop' || e.surface === 'vscode'
+    const onHover = (control: ReturnType<typeof Button>) =>
+      canHover ? (
+        <Box display="none" hover={{ display: 'flex' }}>
+          {control}
+        </Box>
+      ) : (
+        control
+      )
+    const folded = await read($, folds)
+
+    // The mark is the checkbox; the text is plain text beside it, so it wraps
+    // instead of being cut to one line inside a button.
     const row = (todo: StackedTodo) => {
       const isDone = !isOpen(todo)
       const mark = isDone ? '☑' : todo.status === 'in_progress' ? '◐' : '☐'
-      const label = [
-        <Text color={isDone ? 'success' : todo.status === 'in_progress' ? 'warning' : undefined}>
-          {`${mark} `}
-        </Text>,
-        <Text
-          strikethrough={isDone}
-          dimColor={isDone}
-          weight={todo.status === 'in_progress' ? 'semibold' : undefined}
-        >
-          {todo.text}
-        </Text>,
-      ]
-      if (isDropped(todo)) label.push(<Text color="warning">{' · 모델 목록에서 빠짐'}</Text>)
 
       return (
-        <Box key={`r-${todo.id}`} flexDirection="row" justifyContent="space-between" gap={1}>
+        <Box key={`r-${todo.id}`} flexDirection="row" gap={1} alignItems="flex-start">
           <Button key={`t-${todo.id}`} plain onPress={() => change($, v => toggle(v, todo.id))}>
-            {label}
+            <Text color={isDone ? 'success' : todo.status === 'in_progress' ? 'warning' : undefined}>{mark}</Text>
           </Button>
-          <Button
-            key={`x-${todo.id}`}
-            plain
-            dimColor
-            label="✕"
-            onPress={() => change($, v => remove(v, todo.id))}
-          />
+          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+            <Text
+              wrap="wrap"
+              strikethrough={isDone}
+              dimColor={isDone}
+              weight={todo.status === 'in_progress' ? 'semibold' : undefined}
+            >
+              {todo.text}
+            </Text>
+            {isDropped(todo) && (
+              <Text color="warning" size="footnote">
+                모델 목록에서 빠짐
+              </Text>
+            )}
+          </Box>
+          {onHover(
+            <Button key={`x-${todo.id}`} plain dimColor label="✕" onPress={() => change($, v => remove(v, todo.id))} />,
+          )}
         </Box>
       )
     }
 
-    const section = ({ group, todos: visible }: { group: TodoGroup; todos: StackedTodo[] }) => (
-      <Box flexDirection="column">
-        <Box key={`g-${group.id}`} flexDirection="row" justifyContent="space-between" gap={1}>
-          <Text weight="semibold" wrap="truncate-end">{`▸ ${group.request}`}</Text>
-          <Box flexDirection="row" gap={1}>
-            <Text dimColor tabular>
-              {`${group.todos.filter(todo => !isOpen(todo)).length}/${group.todos.length}`}
-            </Text>
+    const section = ({ group, todos: visible }: { group: TodoGroup; todos: StackedTodo[] }) => {
+      const finished = group.todos.filter(todo => !isOpen(todo)).length
+      const isGroupFolded = folded[group.id] ?? finished === group.todos.length
+      const ordered = visible
+        .map((todo, index) => ({ todo, index }))
+        .sort((a, b) => STATUS_ORDER[a.todo.status] - STATUS_ORDER[b.todo.status] || a.index - b.index)
+        .map(({ todo }) => todo)
+
+      return (
+        <Box key={`s-${group.id}`} flexDirection="column" gap="xs">
+          <Box key={`g-${group.id}`} flexDirection="row" gap={1} alignItems="flex-start">
             <Button
-              key={`gx-${group.id}`}
+              key={`gf-${group.id}`}
               plain
               dimColor
-              label="✕"
-              onPress={() => change($, v => removeGroup(v, group.id))}
+              label={isGroupFolded ? '▸' : '▾'}
+              onPress={() => update($, folds, all => ({ ...all, [group.id]: !isGroupFolded }))}
             />
+            <Box flexGrow={1} flexShrink={1}>
+              <Text weight="semibold" wrap="wrap">
+                {titleOf(group.request, TITLE_MAX)}
+              </Text>
+            </Box>
+            <Text dimColor size="footnote" tabular>
+              {`${finished}/${group.todos.length}`}
+            </Text>
+            {onHover(
+              <Button
+                key={`gx-${group.id}`}
+                plain
+                dimColor
+                label="✕"
+                onPress={() => change($, v => removeGroup(v, group.id))}
+              />,
+            )}
           </Box>
+          {!isGroupFolded && (
+            <Box flexDirection="column" gap="xs" paddingLeft={2}>
+              {ordered.map(row)}
+            </Box>
+          )}
         </Box>
-        <Box flexDirection="column" paddingLeft={2}>
-          {visible.map(row)}
-        </Box>
-      </Box>
-    )
+      )
+    }
 
     const summary = `남은 ${open} · 진행 중 ${working} · 완료 ${done}` + (dropped > 0 ? ` · 빠짐 ${dropped}` : '')
 
@@ -503,7 +563,7 @@ export const register: Register = on => {
         {header}
       </Box>
     ) : (
-      <Box key="todo-card" flexDirection="column" gap={1} borderStyle="round" borderDimColor paddingX={1}>
+      <Box key="todo-card" flexDirection="column" gap="md" borderStyle="round" borderDimColor paddingX={1}>
         {header}
         <Text dimColor tabular>
           {summary}
