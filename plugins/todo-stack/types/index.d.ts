@@ -39,6 +39,9 @@ declare module 'claude-code' {
       isConfirmingClear: boolean
       // The person folded the card to its header.
       isCollapsed: boolean
+      // Groups the person folded (true) or unfolded (false); a group not named
+      // here is folded once all its todos are done.
+      folds: Record<string, boolean>
     }
   }
 }
