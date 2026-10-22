@@ -20,7 +20,7 @@
     {
       "name": "todo-stack",
       "source": "./plugins/todo-stack",
-      "description": "Adds a todo card to the session pane that keeps every todo the model creates on one stack, newest on top, so none is lost to compaction."
+      "description": "Adds a todo card to the session pane that keeps every todo the model creates on one stack shared by every session, newest on top, so none is lost to compaction, a reload or a new session."
     }
   ]
 }
