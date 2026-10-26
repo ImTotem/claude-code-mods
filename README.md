@@ -32,6 +32,8 @@ claude plugin install todo-stack --marketplace ImTotem/claude-code-mods
 
 claude.ai나 데스크톱 앱에서는 **Customize > Plugins > Add > Add marketplace**에 `ImTotem/claude-code-mods`를 넣고, 목록에 나온 모드를 설치하세요. 이렇게 계정에 설치하면 의존성이 자동으로 깔리지 않으니 `session-rail`도 함께 켜 주세요. 계정에 설치한 플러그인은 같은 계정으로 로그인한 Claude Code 세션에 동기화된 플러그인(`<모드>@synced`)으로 들어옵니다. 모드는 Claude Code에서만 동작합니다.
 
+**업데이트가 적용되는 때**: Claude Code는 시작할 때 디스크에 있는 버전을 먼저 로드하고, 새 버전은 그 뒤에 백그라운드에서 받습니다. 그래서 새 버전이 나온 뒤 처음 연 세션에서는 이전 버전이 돌고, `/reload-plugins`를 하거나 다음에 시작할 때부터 새 버전이 적용됩니다. 같은 모드를 셸(`<모드>@claude-code-mods`)과 계정(`<모드>@synced`) 양쪽에 설치했다면 셸에 설치한 쪽이 우선하므로, 한쪽만 남겨 두세요.
+
 비공개 저장소라면 GitHub에서 이 저장소를 읽을 수 있고, 그 컴퓨터에 github.com용 git 자격 증명(SSH 키, 또는 `gh auth login` 후 `gh auth setup-git`)이 있어야 설치됩니다.
 
 ## 브랜치 구성
