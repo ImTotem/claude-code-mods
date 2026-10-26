@@ -360,6 +360,35 @@ test('the per-session stacks of older versions are merged into one, the last use
   expect(await ui.find({ type: 'Text', text: '남은 2 · 진행 중 0 · 완료 2' })).toBeDefined()
 })
 
+test('what an older version stacked after the shared stack was saved is merged in', async ($, on) => {
+  // 0.5.0 saved the shared stack; then a session started on 0.4.0, still on
+  // disk until the update was fetched, and wrote a stack of its own.
+  const seen = engine(on, {
+    stack: {
+      todos: [
+        { id: 't1', text: '공유 스택의 일', status: 'pending', source: 'manual', sessionId: 'session-0' },
+        { id: 't2', text: '예전 버전이 끝낸 일', status: 'pending', source: 'manual', sessionId: 'session-0' },
+      ],
+      muted: [],
+    },
+    'stack:session-1': {
+      todos: [
+        { id: 't3', text: '예전 버전에서 쌓인 일', status: 'pending', source: 'todo', isListed: true },
+        { id: 't2', text: '예전 버전이 끝낸 일', status: 'completed', source: 'manual', sessionId: 'session-0' },
+      ],
+      muted: [],
+    },
+    sessions: ['session-1'],
+  })
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const names = ['예전 버전에서 쌓인 일', '예전 버전이 끝낸 일', '공유 스택의 일']
+  expect(await rowsOf(ui, ...names)).toEqual(names)
+  expect(await ui.find({ type: 'Text', text: '남은 2 · 진행 중 0 · 완료 1' })).toBeDefined()
+  expect([...seen.store.keys()]).toEqual(['stack'])
+})
+
 test('a row shows its ✕ under the pointer where there is one, and always elsewhere', async ($, on) => {
   engine(on)
   await ask($, '지울 수 있는 일')
