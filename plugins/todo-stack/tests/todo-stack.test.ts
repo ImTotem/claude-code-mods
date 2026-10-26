@@ -313,6 +313,41 @@ test("another session's changes are kept and shown, and its list leaves this ses
   expect(seen.instructions).not.toContain('다른 세션의 일')
 })
 
+test("a new session's model takes over earlier todos it lists, instead of stacking them again", async ($, on) => {
+  const seen = engine(on, {
+    stack: {
+      todos: [
+        { id: 'm1', text: '직접 넣은 일', status: 'pending', source: 'manual', sessionId: 'session-0' },
+        { id: 't1', text: '어제 못 끝낸 일', status: 'pending', source: 'todo', sessionId: 'session-0', isListed: true },
+        { id: 't2', text: '어제 맡긴 작업', status: 'in_progress', source: 'task', sessionId: 'session-0', taskId: '1' },
+      ],
+      muted: [],
+    },
+  })
+  seen.sessionId = 'session-1'
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const names = ['직접 넣은 일', '어제 못 끝낸 일', '어제 맡긴 작업']
+
+  // Say the person put the open todos in the prompt and the model lists them.
+  await todoWrite($, [
+    { content: '어제 못 끝낸 일', status: 'completed' },
+    { content: '직접 넣은 일', status: 'in_progress' },
+  ])
+  expect(await rowsOf(ui, ...names)).toEqual(names)
+  expect(await ui.find({ type: 'Text', text: '남은 2 · 진행 중 2 · 완료 1' })).toBeDefined()
+
+  // Through the Task tools too: its id here is this session's own.
+  await $.tool.call({ tool: 'TaskCreate', subject: '어제 맡긴 작업', description: '...' })
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'completed' })
+  expect(await rowsOf(ui, ...names)).toEqual(names)
+  expect(await ui.find({ type: 'Text', text: '남은 1 · 진행 중 1 · 완료 2' })).toBeDefined()
+
+  // Taken over, they are this session's: its next list drops what it leaves out.
+  await todoWrite($, [{ content: '어제 못 끝낸 일', status: 'completed' }])
+  expect(await ui.findAll({ type: 'Text', text: '모델 목록에서 빠짐' })).toHaveLength(1)
+})
+
 test('the per-session stacks of older versions are merged into one, the last used on top', async ($, on) => {
   const grouped = {
     groups: [
