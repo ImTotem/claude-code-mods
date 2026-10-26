@@ -49,8 +49,13 @@ function oneLine(text: string, max: number): string {
 const isOpen = (todo: StackedTodo) => todo.status !== 'completed'
 const isDropped = (todo: StackedTodo) => todo.source === 'todo' && todo.isListed === false && isOpen(todo)
 // The model's todos and task ids are its session's own: another session's
-// list never matches, updates or drops them.
+// list never drops them, and its task ids never reach them.
 const isModelTodoOf = (todo: StackedTodo, sessionId: string) => todo.sessionId === sessionId
+// An unfinished todo of another session's, or the person's, that this
+// session's model lists under the same text: the stack is one, so the model
+// takes it over (and can finish it) instead of stacking it again.
+const isAdoptable = (todo: StackedTodo, text: string, sessionId: string) =>
+  isOpen(todo) && todo.text === text && (todo.source === 'manual' || !isModelTodoOf(todo, sessionId))
 
 function mapTodos(value: TodoStack, fn: (todo: StackedTodo) => StackedTodo | null): TodoStack {
   return {
@@ -117,6 +122,18 @@ function applyTodoWrite(value: TodoStack, list: readonly ModelTodo[], sessionId:
       continue
     }
 
+    const adopted = next.todos.find(todo => !matched.has(todo.id) && isAdoptable(todo, item.text, sessionId))
+    if (adopted !== undefined) {
+      matched.add(adopted.id)
+      next = mapTodos(next, todo => {
+        if (todo.id !== adopted.id) return todo
+        const { taskId: _, ...rest } = todo
+
+        return { ...rest, source: 'todo', sessionId, isListed: true, modelStatus: item.status, status: item.status }
+      })
+      continue
+    }
+
     const id = newId()
     matched.add(id)
     added.push({
@@ -148,11 +165,21 @@ function applyTaskCreate(value: TodoStack, taskId: string, subject: string, sess
 
     return rest
   })
+  const text = oneLine(subject, MAX_TEXT)
+  const adopted = released.todos.find(todo => isAdoptable(todo, text, sessionId))
+  if (adopted !== undefined) {
+    return mapTodos(released, todo => {
+      if (todo.id !== adopted.id) return todo
+      const { isListed: _, ...rest } = todo
+
+      return { ...rest, source: 'task', sessionId, taskId, modelStatus: 'pending' }
+    })
+  }
 
   return push(released, [
     {
       id: newId(),
-      text: oneLine(subject, MAX_TEXT),
+      text,
       status: 'pending',
       source: 'task',
       sessionId,
