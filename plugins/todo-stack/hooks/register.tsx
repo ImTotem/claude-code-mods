@@ -12,7 +12,9 @@ const MAX_TEXT = 500
 // One stack for every session, kept in the plugin's store.
 const STORE_KEY = 'stack'
 // Versions before 0.5.0 kept a stack per session under `stack:<id>`, listed
-// oldest first under `sessions`.
+// oldest first under `sessions`. Claude Code starts a session on the version
+// it has on disk and fetches an update after, so such a version can still run
+// for a while once this one has saved the shared stack.
 const OLD_PREFIX = 'stack:'
 const OLD_INDEX = 'sessions'
 // How often an open session reads the store again for other sessions' changes.
@@ -264,19 +266,28 @@ function openList(todos: readonly StackedTodo[], label: (status: TodoStatus) => 
     .join('\n')
 }
 
-// The per-session stacks older versions kept, merged into one: the session
-// used last on top. The old keys go once the merged stack is saved.
-async function migrate($: EngineInterface): Promise<TodoStack> {
-  const keys = (await $.store.keys()).filter(key => key.startsWith(OLD_PREFIX))
+// The per-session stacks older versions kept, merged onto `base`: the session
+// used last on top, and above what `base` holds, since an older version still
+// running wrote them after it. A todo both hold is kept as the older version
+// left it. The old keys go once the merged stack is saved.
+async function migrate($: EngineInterface, keys: readonly string[], base: TodoStack): Promise<TodoStack> {
   const ids = keys.map(key => key.slice(OLD_PREFIX.length))
   const index = await $.store.get(OLD_INDEX)
   const order = Array.isArray(index) ? index.filter((id): id is string => typeof id === 'string') : []
   const oldestFirst = [...ids.filter(id => !order.includes(id)), ...order.filter(id => ids.includes(id))]
 
-  let merged = EMPTY
+  let merged = base
   for (const id of oldestFirst) {
     const old = toStack(await $.store.get(`${OLD_PREFIX}${id}`), id)
-    if (old !== undefined) merged = { todos: [...old.todos, ...merged.todos], muted: [...merged.muted, ...old.muted] }
+    if (old === undefined) continue
+    const fresh = new Set(old.todos.map(todo => todo.id))
+    merged = {
+      todos: [...old.todos, ...merged.todos.filter(todo => !fresh.has(todo.id))],
+      muted: [
+        ...merged.muted,
+        ...old.muted.filter(entry => !merged.muted.some(m => m.sessionId === entry.sessionId && m.text === entry.text)),
+      ],
+    }
   }
   merged = tidy(merged)
 
@@ -289,7 +300,11 @@ async function migrate($: EngineInterface): Promise<TodoStack> {
 
 // The store holds the stack; what a session holds in state is a copy of it.
 async function load($: EngineInterface): Promise<TodoStack> {
-  return toStack(await $.store.get(STORE_KEY)) ?? migrate($)
+  const saved = toStack(await $.store.get(STORE_KEY))
+  const leftovers = (await $.store.keys()).filter(key => key.startsWith(OLD_PREFIX))
+  if (saved !== undefined && leftovers.length === 0) return saved
+
+  return migrate($, leftovers, saved ?? EMPTY)
 }
 
 async function hold($: EngineInterface, value: TodoStack) {
