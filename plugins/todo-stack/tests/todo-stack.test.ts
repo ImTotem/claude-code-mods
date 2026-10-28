@@ -43,6 +43,7 @@ function engine(on: On, stored: Record<string, unknown> = {}) {
     clock: mock.clock(on),
     // The session the next call comes from; another session shares the store.
     sessionId: 'session-1',
+    tools: [] as { name: string; isDeferred?: boolean; description: string }[],
   }
   let tasks = 0
   on('session.id', () => ({ value: seen.sessionId }))
@@ -65,6 +66,10 @@ function engine(on: On, stored: Record<string, unknown> = {}) {
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => {
+    seen.tools.push(e)
+    return { value: { tool: `mcp__todo-stack__${e.name}` } }
+  })
   on('tool.call', ($, e) => {
     if (e.tool === 'TaskCreate') {
       tasks += 1
@@ -346,6 +351,61 @@ test("a new session's model takes over earlier todos it lists, instead of stacki
   // Taken over, they are this session's: its next list drops what it leaves out.
   await todoWrite($, [{ content: '어제 못 끝낸 일', status: 'completed' }])
   expect(await ui.findAll({ type: 'Text', text: '모델 목록에서 빠짐' })).toHaveLength(1)
+})
+
+test('the model gets a todos tool to read and edit the shared stack', async ($, on) => {
+  const seen = engine(on, {
+    stack: {
+      todos: [
+        { id: 'm1', text: '직접 넣은 일', status: 'pending', source: 'manual', sessionId: 'session-0' },
+        { id: 't1', text: '어제 못 끝낸 일', status: 'in_progress', source: 'todo', sessionId: 'session-0', isListed: true },
+        { id: 'c1', text: '끝난 일', status: 'completed', source: 'todo', sessionId: 'session-0', isListed: true },
+      ],
+      muted: [],
+    },
+  })
+  seen.sessionId = 'session-1'
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  expect(seen.tools.map(tool => [tool.name, tool.isDeferred])).toEqual([['todos', false]])
+
+  // The tool is the plugin's own, so the session's tool types do not name it.
+  type Answer = { result?: unknown; deny?: string; isError?: true; text?: string }
+  const call = $.tool.call as unknown as (input: Record<string, unknown>) => Promise<Answer>
+  const todos = (input: Record<string, unknown>) => call({ tool: 'mcp__todo-stack__todos', ...input })
+  const listed = await todos({ action: 'list' })
+  expect(listed.result).toBe(
+    '2 open, 1 completed. Top of the stack first:\n' +
+      '- m1 [pending] 직접 넣은 일 (added by hand)\n' +
+      '- t1 [in_progress] 어제 못 끝낸 일 (another session)',
+  )
+  expect(String((await todos({ action: 'list', includeDone: true })).result)).toContain('- c1 [completed] 끝난 일')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await todos({ action: 'update', id: 't1', status: 'completed' })).result).toBe(
+    'Updated t1: [completed] 어제 못 끝낸 일',
+  )
+  expect((await todos({ action: 'add', text: '새로 맡은 일' })).result).toBe('Added on top of the stack: 새로 맡은 일')
+  expect((await todos({ action: 'remove', id: 'm1' })).result).toBe('Removed: 직접 넣은 일')
+  expect(await rowsOf(ui, '새로 맡은 일', '직접 넣은 일', '어제 못 끝낸 일', '끝난 일')).toEqual([
+    '새로 맡은 일',
+    '어제 못 끝낸 일',
+    '끝난 일',
+  ])
+  expect(await ui.find({ type: 'Text', text: '남은 1 · 진행 중 0 · 완료 2' })).toBeDefined()
+
+  // What the tool cannot do is told back to the model as an error.
+  for (const input of [
+    { action: 'update', id: 'nope', status: 'completed' },
+    { action: 'update', id: 't1' },
+    { action: 'update', id: 't1', status: 'done' },
+    { action: 'add', text: '  ' },
+    { action: 'clear' },
+  ]) {
+    const refused = await todos(input)
+    expect(refused.result).toBeUndefined()
+    expect(refused.deny).toEqual(expect.any(String))
+  }
+  expect(await ui.find({ type: 'Text', text: '남은 1 · 진행 중 0 · 완료 2' })).toBeDefined()
 })
 
 test('the per-session stacks of older versions are merged into one, the last used on top', async ($, on) => {

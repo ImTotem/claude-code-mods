@@ -20,6 +20,39 @@ const OLD_INDEX = 'sessions'
 // How often an open session reads the store again for other sessions' changes.
 const WATCH_MS = 10_000
 
+// The tool the model reads and edits the stack with: mcp__todo-stack__todos.
+const TOOL = 'todos'
+// Matched by pattern: the tool names a matcher takes are the built-in ones.
+const TOOL_CALL = new RegExp(`^mcp__todo-stack__${TOOL}$`)
+const STATUSES: readonly string[] = ['pending', 'in_progress', 'completed']
+const TOOL_SPEC = {
+  name: TOOL,
+  description: [
+    "The user's todo stack (the todo-stack plugin): one list shared by every session, shown in the session pane, " +
+      'newest on top. It outlives compaction and sessions, so it can hold todos from earlier sessions and ones the ' +
+      'user added by hand. Check it when the user mentions their todos or the stack, and mark a todo completed when ' +
+      'you finish it.',
+    'Todos you make with TodoWrite or TaskCreate are stacked here on their own. Listing an open todo of the stack in ' +
+      'TodoWrite under its exact text takes that todo over, so its status then follows your list.',
+    'action "list": the todos, top first, with their ids (open ones only unless includeDone is true).',
+    'action "add": puts `text` on top as a new todo.',
+    'action "update": sets the `status` (pending, in_progress, completed) and/or the `text` of the todo `id`.',
+    'action "remove": removes the todo `id`. Remove only what the user asks you to; mark finished work completed.',
+  ].join('\n'),
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['list', 'add', 'update', 'remove'] },
+      id: { type: 'string', description: 'The todo, as "list" names it (update, remove).' },
+      text: { type: 'string', description: 'The todo\'s text (add, update).' },
+      status: { type: 'string', enum: STATUSES, description: 'The todo\'s new status (update).' },
+      includeDone: { type: 'boolean', description: 'List completed todos too (list).' },
+    },
+    required: ['action'],
+  },
+  isDeferred: false,
+}
+
 const STATUS_LABEL: Record<TodoStatus, string> = {
   pending: '대기',
   in_progress: '진행 중',
@@ -247,6 +280,36 @@ function addManual(value: TodoStack, text: string, sessionId: string): TodoStack
   return push(value, [{ id: newId(), text, status: 'pending', source: 'manual', sessionId }])
 }
 
+// The model's edit through its tool. A status set this way holds as the
+// person's press does: until the model's own list reports a different one.
+function edit(value: TodoStack, id: string, status: TodoStatus | undefined, text: string | undefined): TodoStack {
+  return mapTodos(value, todo => {
+    if (todo.id !== id) return todo
+    let next = todo
+    if (status !== undefined) next = { ...next, status }
+    if (text !== undefined) next = { ...next, text }
+
+    return next
+  })
+}
+
+// The stack as the tool answers "list": top first, each todo with its id.
+function listing(value: TodoStack, sessionId: string, includeDone: boolean): string {
+  if (value.todos.length === 0) return 'The stack is empty.'
+
+  const open = value.todos.filter(isOpen).length
+  const shown = includeDone ? value.todos : value.todos.filter(isOpen)
+  const origin = (todo: StackedTodo) =>
+    todo.source === 'manual' ? 'added by hand' : todo.sessionId === sessionId ? 'this session' : 'another session'
+  const lines = shown.map(
+    todo =>
+      `- ${todo.id} [${todo.status}] ${todo.text} (${origin(todo)}${isDropped(todo) ? ", dropped from its session's list" : ''})`,
+  )
+  const head = `${open} open, ${value.todos.length - open} completed. Top of the stack first:`
+
+  return lines.length === 0 ? `${head}\n(no open todos)` : `${head}\n${lines.join('\n')}`
+}
+
 // A stack as stored or held: this version's; 0.4's, a flat stack of one
 // session's; or an older one's that kept a group per request (newest group
 // first, a group's todos in their order). Todos and muted texts without a
@@ -356,12 +419,14 @@ function refresh($: EngineInterface): Promise<void> {
   return serially(async () => hold($, await load($)))
 }
 
-function change($: EngineInterface, fn: (value: TodoStack, sessionId: string) => TodoStack): Promise<void> {
+function change($: EngineInterface, fn: (value: TodoStack, sessionId: string) => TodoStack): Promise<TodoStack> {
   return serially(async () => {
     const sessionId = await $.session.id()
     const value = fn(await load($), sessionId)
     await $.store.set(STORE_KEY, value)
     await hold($, value)
+
+    return value
   })
 }
 
@@ -397,10 +462,62 @@ export const register: Register = on => {
       argumentHint: '[추가할 할 일]',
     })
 
+    await $.tool.register(TOOL_SPEC).catch(() => undefined)
     await refresh($).catch(() => undefined)
     watch($)
 
     return next(e)
+  })
+
+  on('tool.call', { tool: TOOL_CALL }, async ($, e) => {
+    const input = e as Record<string, unknown>
+    const sessionId = await $.session.id()
+    const id = typeof input.id === 'string' ? input.id.trim() : ''
+    const text = typeof input.text === 'string' ? oneLine(input.text, MAX_TEXT) : undefined
+    const status = typeof input.status === 'string' ? input.status : undefined
+
+    switch (input.action) {
+      case 'list':
+        return { result: listing(await serially(() => load($)), sessionId, input.includeDone === true) }
+
+      case 'add': {
+        if (text === undefined || text === '') return { deny: 'action "add" needs a non-empty `text`.' }
+        await change($, (value, owner) => addManual(value, text, owner))
+
+        return { result: `Added on top of the stack: ${text}` }
+      }
+
+      case 'update':
+      case 'remove': {
+        if (id === '') return { deny: `action "${input.action}" needs the todo's \`id\` (action "list" names them).` }
+        if (status !== undefined && !STATUSES.includes(status)) {
+          return { deny: '`status` is one of pending, in_progress, completed.' }
+        }
+        if (text === '') return { deny: '`text` cannot be empty.' }
+        if (input.action === 'update' && status === undefined && text === undefined) {
+          return { deny: 'action "update" needs a `status`, a `text`, or both.' }
+        }
+
+        const found: { todo?: StackedTodo } = {}
+        await change($, value => {
+          found.todo = value.todos.find(todo => todo.id === id)
+          if (found.todo === undefined) return value
+
+          return input.action === 'remove' ? remove(value, id) : edit(value, id, status as TodoStatus | undefined, text)
+        })
+        if (found.todo === undefined) return { deny: `No todo has the id "${id}"; action "list" names them.` }
+
+        return {
+          result:
+            input.action === 'remove'
+              ? `Removed: ${found.todo.text}`
+              : `Updated ${id}: [${status ?? found.todo.status}] ${text ?? found.todo.text}`,
+        }
+      }
+
+      default:
+        return { deny: '`action` is one of list, add, update, remove.' }
+    }
   })
 
   on('command.run', { command: 'todo-stack' }, async ($, e) => {
