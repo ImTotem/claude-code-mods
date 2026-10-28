@@ -4,7 +4,8 @@ export type StackedTodo = {
   id: string
   text: string
   status: TodoStatus
-  // Where it came from: the model's TodoWrite list, its Task tools, or the person.
+  // Where it came from: the model's TodoWrite list, its Task tools, or by hand
+  // (the person, or the model through the plugin's todos tool).
   source: 'todo' | 'task' | 'manual'
   // The session it was made in. The stack is shared by every session, but a
   // model's list and task ids are its own session's.
