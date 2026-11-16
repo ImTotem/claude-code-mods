@@ -8,6 +8,8 @@ import type { MutedText, StackedTodo, TodoStack, TodoStatus } from '../types'
 // every plugin's (`plugin: '*'`) for this pane id.
 const RAIL = 'session-rail'
 const MAX_TODOS = 300
+// The open todos the pane's widget form lists, from the top of the stack.
+const WIDGET_ROWS = 5
 const MAX_TEXT = 500
 // One stack for every session, kept in the plugin's store.
 const STORE_KEY = 'stack'
@@ -637,6 +639,46 @@ export const register: Register = on => {
     const dropped = todos.filter(isDropped).length
     const done = todos.length - open
     const shown = isHiding ? todos.filter(isOpen) : todos
+    const mark = (todo: StackedTodo) => (!isOpen(todo) ? '☑' : todo.status === 'in_progress' ? '◐' : '☐')
+    const markColor = (todo: StackedTodo) =>
+      !isOpen(todo) ? 'success' : todo.status === 'in_progress' ? 'warning' : undefined
+
+    // The desktop app's widget, the pane's small form (in the session rail or a
+    // corner of the chat): a glance, as clicks may not reach it, so no
+    // controls. The top of the stack's open todos, one line each.
+    if (e.props.placement === 'widget') {
+      const top = todos.filter(isOpen).slice(0, WIDGET_ROWS)
+      const glance = (
+        <Box key="todo-card" flexDirection="column" gap="xs">
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Text weight="semibold">할 일</Text>
+            <Text dimColor size="footnote" tabular>{`남은 ${open}`}</Text>
+          </Box>
+          {top.length === 0 ? (
+            <Text dimColor size="footnote">
+              남은 할 일이 없습니다
+            </Text>
+          ) : (
+            top.map(todo => (
+              <Box key={`w-${todo.id}`} flexDirection="row" gap={1}>
+                <Text color={markColor(todo)}>{mark(todo)}</Text>
+                <Text size="footnote" wrap="truncate-end" weight={todo.status === 'in_progress' ? 'semibold' : undefined}>
+                  {todo.text}
+                </Text>
+              </Box>
+            ))
+          )}
+          {open > top.length && <Text dimColor size="footnote">{`외 ${open - top.length}개`}</Text>}
+        </Box>
+      )
+
+      return (
+        <Box flexDirection="column" gap="sm">
+          {above}
+          {glance}
+        </Box>
+      )
+    }
 
     // Where a pointer can hover, a ✕ shows only while it is over its row (the
     // keyed Box around it).
@@ -654,12 +696,11 @@ export const register: Register = on => {
     // instead of being cut to one line inside a button.
     const row = (todo: StackedTodo) => {
       const isDone = !isOpen(todo)
-      const mark = isDone ? '☑' : todo.status === 'in_progress' ? '◐' : '☐'
 
       return (
         <Box key={`r-${todo.id}`} flexDirection="row" gap={1} alignItems="flex-start">
           <Button key={`t-${todo.id}`} plain onPress={() => change($, v => toggle(v, todo.id))}>
-            <Text color={isDone ? 'success' : todo.status === 'in_progress' ? 'warning' : undefined}>{mark}</Text>
+            <Text color={markColor(todo)}>{mark(todo)}</Text>
           </Button>
           <Box flexDirection="column" flexGrow={1} flexShrink={1}>
             <Text
