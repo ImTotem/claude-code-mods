@@ -446,6 +446,54 @@ export const register: Register = (on, options) => {
         ? `사용량을 불러오지 못했습니다 (${why})`
         : '사용량을 불러오는 중입니다'
 
+    // The desktop app's widget, the pane's small form (in the session rail or a
+    // corner of the chat): a glance, as clicks may not reach it. Each limit's
+    // name, figure and bar; reset times and reasons wait for the full pane.
+    if (e.props.placement === 'widget') {
+      const glance = (name: string, value: string, percent: number) => (
+        <Box flexDirection="column" gap="xs">
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Text size="footnote" wrap="truncate-end">
+              {name}
+            </Text>
+            <Text dimColor size="footnote" tabular>
+              {value}
+            </Text>
+          </Box>
+          {bar(percent)}
+        </Box>
+      )
+      const rows = [
+        ...(shot?.windows ?? []).map(window =>
+          glance(LABELS[window.kind] ?? window.kind, `${Math.round(window.percent)}%`, window.percent),
+        ),
+        ...(shot?.credit !== undefined
+          ? [glance(shot.credit.label, `${dollars(shot.credit.remaining)} 남음`, shot.credit.percent)]
+          : []),
+      ]
+      const status = isScopeDenied
+        ? '이 세션에서는 볼 수 없습니다'
+        : fetched?.error !== undefined
+          ? '불러오지 못했습니다'
+          : '불러오는 중입니다'
+
+      return (
+        <Box flexDirection="column" gap="sm">
+          <Box key="usage-card" flexDirection="column" gap="sm">
+            <Text weight="semibold">사용량</Text>
+            {rows.length === 0 ? (
+              <Text dimColor size="footnote">
+                {status}
+              </Text>
+            ) : (
+              rows
+            )}
+          </Box>
+          {below}
+        </Box>
+      )
+    }
+
     const card = (
       <Box key="usage-card" flexDirection="column" gap="md" borderStyle="round" borderDimColor paddingX={1}>
         <Text weight="bold" size="heading">

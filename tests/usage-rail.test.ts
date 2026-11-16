@@ -117,6 +117,29 @@ test("the card shows the app's three rows, in its words", async ($, on) => {
   }
 })
 
+test("in the desktop app's widget the card is a glance: each limit's figure and bar", async ($, on) => {
+  const seen = engine(on)
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  const shown = await texts(ui)
+  for (const line of ['사용량', '세션 한도', '29%', '매주', '4%', '클라우드 세션 크레딧', 'US$77 남음']) {
+    expect(shown, line).toContain(line)
+  }
+  // Reset times wait for the full pane, and no control is drawn.
+  expect(shown.some(text => /재설정|만료/.test(text))).toBe(false)
+  expect(await ui.findAll({ type: 'Svg' })).toHaveLength(3)
+  expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+})
+
+test('the widget says in a word why it is empty', async ($, on) => {
+  const seen = engine(on, 'no-credential', { ...HEADERS, rateLimits: [] })
+  await start($, seen)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  expect(await texts(ui)).toEqual(['사용량', '불러오지 못했습니다'])
+})
+
 test('the bar is an SVG where the surface draws one, a line of cells on the terminal', async ($, on) => {
   const seen = engine(on)
   await start($, seen)
