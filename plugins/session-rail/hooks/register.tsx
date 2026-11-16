@@ -65,10 +65,22 @@ export const register: Register = on => {
       description: '세션 패널(사용량 · 할 일 카드)을 엽니다',
     })
 
-    if (e.isInteractive) await open($).catch(() => undefined)
+    // Opened at the start on every surface, the apps included: a pane opened
+    // before an app attaches waits open, and is drawn when one does.
+    await open($).catch(() => undefined)
 
     return next(e)
   })
+
+  // An app attached: the pane opened at the start may be drawn now, so the
+  // footer button reads what the engine holds.
+  on('session.attach', async ($, e, next) => {
+    const attached = await next(e)
+    const pane = (await $.ui.panes().catch(() => [])).find(one => one.id === PANE)
+    if (pane !== undefined) await update($, isOpen, () => pane.isPlaced)
+
+    return attached
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'session-rail' }, async $ => {
     const opened = await reopen($)

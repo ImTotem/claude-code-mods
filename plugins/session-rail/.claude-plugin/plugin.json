@@ -1,6 +1,6 @@
 {
   "name": "session-rail",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "One session pane that other mods add cards to, with a button at the right of the prompt footer to open and close it.",
   "author": {
     "name": "ImTotem"
