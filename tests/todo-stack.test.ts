@@ -514,18 +514,50 @@ test('clearing everything asks first', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: '사라질 일' })).toBeUndefined()
 })
 
-test('the command opens the session pane, adding a todo when given one', async ($, on) => {
-  const seen = engine(on)
-  const run = (args: string) =>
-    $.command.run({
-      command: 'todo-stack',
-      args,
-      origin: { kind: 'composer' },
-      presentation: { isFullscreen: false, columns: 80 },
+// session-rail as it answers this mod's command: it opens its pane, which
+// refuses an open of this mod's own, and keeps whether a surface draws it.
+const RAIL_OPENS = {
+  name: 'session-rail',
+  register(on: On) {
+    on('command.run', { command: 'todo-stack' }, async ($, e, next) => {
+      const opened = await $.ui.open({ id: 'session-rail', title: '세션' })
+      await $.state.set({ plugin: 'session-rail', key: 'isOpen' }, opened.isPlaced)
+      return next(e)
     })
+  },
+}
+
+const RAIL_UNPLACED = {
+  name: 'session-rail',
+  register(on: On) {
+    on('command.run', { command: 'todo-stack' }, async ($, e, next) => {
+      await $.state.set({ plugin: 'session-rail', key: 'isOpen' }, false)
+      return next(e)
+    })
+  },
+}
+
+const runTodoStack = ($: Engine, args: string) =>
+  $.command.run({
+    command: 'todo-stack',
+    args,
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
+
+test('the command says when session-rail could not draw its pane', { plugins: [RAIL_UNPLACED] }, async ($, on) => {
+  const seen = engine(on)
+  expect(await runTodoStack($, '빵 사기')).toMatchObject({ text: '할 일을 추가했습니다: 빵 사기 (세션 패널을 열지 못했습니다)' })
+  expect(seen.opens).toEqual([])
+})
+
+test('the command has session-rail open its pane, adding a todo when given one', { plugins: [RAIL_OPENS] }, async ($, on) => {
+  const seen = engine(on)
+  const run = (args: string) => runTodoStack($, args)
 
   expect(await run('')).toMatchObject({ text: '할 일 스택을 열었습니다.' })
   expect(await run('우유 사기')).toMatchObject({ text: '할 일을 추가했습니다: 우유 사기' })
+  // Opened by session-rail alone: this mod opens nothing of its own.
   expect(seen.opens).toEqual(['session-rail', 'session-rail'])
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
