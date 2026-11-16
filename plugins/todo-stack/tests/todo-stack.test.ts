@@ -498,6 +498,33 @@ test('a row shows its ✕ under the pointer where there is one, and always elsew
   }
 })
 
+test("in the desktop app's widget the card lists the stack's top open todos, with no controls", async ($, on) => {
+  engine(on)
+  await ask($, '여러 일')
+  await todoWrite($, [
+    { content: '첫째', status: 'in_progress' },
+    { content: '둘째', status: 'completed' },
+    { content: '셋째', status: 'pending' },
+    { content: '넷째', status: 'pending' },
+    { content: '다섯째', status: 'pending' },
+    { content: '여섯째', status: 'pending' },
+    { content: '일곱째', status: 'pending' },
+  ])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, placement: 'widget' } })
+  const names = ['첫째', '둘째', '셋째', '넷째', '다섯째', '여섯째', '일곱째']
+  expect(await rowsOf(ui, ...names)).toEqual(['첫째', '셋째', '넷째', '다섯째', '여섯째'])
+  expect(await ui.find({ type: 'Text', text: '남은 6' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '외 1개' })).toBeDefined()
+  expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+  expect(await ui.findAll({ type: 'Input' })).toHaveLength(0)
+  await ui.unmount()
+
+  // The full pane is the card as before.
+  const full = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await rowsOf(full, ...names)).toEqual(names)
+})
+
 test('clearing everything asks first', async ($, on) => {
   engine(on)
   await ask($, '지우기')
