@@ -2,7 +2,9 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 // Other mods add their cards by hooking ui.render for
-// { component: 'Pane', requestId: 'session-rail' } and wrapping next(e).
+// { component: 'Pane', requestId: 'session-rail', plugin: '*' } and wrapping
+// next(e): a Pane hook hears its own plugin's panes unless its matcher names
+// whose.
 const PANE = 'session-rail'
 const TITLE = '세션'
 // Prompts the person typed, here or through Remote Control.
@@ -40,6 +42,12 @@ async function reopen($: EngineInterface) {
   return open($)
 }
 
+// Another mod's command: open the pane, and say why where it cannot be drawn.
+async function openFor($: EngineInterface) {
+  const opened = await reopen($)
+  if (!opened.isPlaced) $.ui.toast(`세션 패널을 열지 못했습니다: ${opened.reason}`)
+}
+
 // The footer button: open the pane, or close it as the person's own close
 // would, so a prompt does not bring it back.
 async function toggle($: EngineInterface) {
@@ -70,6 +78,22 @@ export const register: Register = on => {
     }
   })
 
+  // /usage-rail and /todo-stack show their cards, so they open this pane too.
+  // A pane another plugin holds refuses their own open, so it is opened here,
+  // as the person's command asks, and the command runs on (once: no .catch
+  // here, which would run it again after a failure of its own).
+  on('command.run', { command: 'usage-rail' }, async ($, e, next) => {
+    await openFor($).catch(() => undefined)
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'todo-stack' }, async ($, e, next) => {
+    await openFor($).catch(() => undefined)
+
+    return next(e)
+  })
+
   on('prompt.submit', async ($, e, next) => {
     if (e.isMeta !== true && PERSONAL_ORIGINS.includes(e.origin.kind)) {
       await showPane($).catch(() => undefined)
@@ -78,7 +102,7 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // usage-rail's and todo-stack's commands open this pane too.
+  // An open of this pane, the person's or one this plugin made for another.
   on('ui.open', { id: PANE }, async ($, e, next) => {
     const opened = await next(e)
     if (opened.value?.isPlaced === true) {

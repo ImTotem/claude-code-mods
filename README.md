@@ -4,7 +4,7 @@
 
 - 세션이 시작되면 패널을 엽니다. 다만 엔진은 사용자가 요청하지 않은 패널을 화면 폭이 144칸 이상일 때만 붙입니다. 데스크톱 앱처럼 그보다 좁으면 **첫 프롬프트를 보낼 때** 엽니다.
 - 프롬프트 아래 오른쪽(모드 표시가 뜨는 자리)에 **세션 패널** 버튼이 늘 있습니다. 누르면 폭과 상관없이 열리고, 열려 있을 때 누르면 닫힙니다. 앱 상단 도구 모음에는 모드가 버튼을 넣을 자리가 없어서 이 자리에 둡니다.
-- 패널을 직접 닫거나 버튼으로 닫으면 그 세션에서는 프롬프트를 보내도 다시 열지 않습니다. 버튼이나 `/session-rail`, `/usage-rail`, `/todo-stack`으로 다시 엽니다. 패널 id는 어느 모드가 열든 하나의 패널을 가리키므로, 카드를 넣는 모드가 직접 열어도 같은 패널이 열립니다.
+- 패널을 직접 닫거나 버튼으로 닫으면 그 세션에서는 프롬프트를 보내도 다시 열지 않습니다. 버튼이나 `/session-rail`, `/usage-rail`, `/todo-stack`으로 다시 엽니다. 패널은 이 모드가 엽니다. Claude Code 2.1.325부터 다른 플러그인이 잡고 있는 패널은 열 수 없어서, `/usage-rail`과 `/todo-stack`이 실행될 때도 이 모드가 대신 엽니다.
 - 패널을 붙일 수 없는 화면이면 그 이유를 알림으로 한 번 알려줍니다.
 
 ## 어디에 뜨나요
@@ -14,10 +14,12 @@
 
 ## 다른 모드에서 카드 넣기
 
-`{ component: 'Pane', requestId: 'session-rail' }`의 `ui.render`를 훅으로 걸고, `next(e)`가 돌려주는 트리를 자기 카드와 함께 감싸서 돌려줍니다. 위에 둘 카드는 `next(e)`보다 앞에, 아래에 둘 카드는 뒤에 놓으면 모드가 불러와지는 순서와 상관없이 순서가 유지됩니다.
+`{ component: 'Pane', requestId: 'session-rail', plugin: '*' }`의 `ui.render`를 훅으로 걸고, `next(e)`가 돌려주는 트리를 자기 카드와 함께 감싸서 돌려줍니다. 위에 둘 카드는 `next(e)`보다 앞에, 아래에 둘 카드는 뒤에 놓으면 모드가 불러와지는 순서와 상관없이 순서가 유지됩니다.
+
+Claude Code 2.1.325부터 패널 그리기 훅은 조건에 `plugin`을 적지 않으면 자기 플러그인이 연 패널만 듣습니다. 이 패널은 `session-rail`이 열므로 `plugin: '*'`(또는 `'session-rail'`)을 꼭 적어야 카드가 그려집니다. 패널을 직접 열지 말고, 자기 명령어로 패널을 보여주고 싶으면 이 모드에 그 명령어 훅을 추가하세요.
 
 ```tsx
-on('ui.render', { component: 'Pane', requestId: 'session-rail' }, async ($, e, next) => {
+on('ui.render', { component: 'Pane', requestId: 'session-rail', plugin: '*' }, async ($, e, next) => {
   const { Box, Text } = $.ui.resolve(e)
   const others = await next(e)
   return (
