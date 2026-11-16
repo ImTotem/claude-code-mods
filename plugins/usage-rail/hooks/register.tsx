@@ -3,10 +3,10 @@ import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
 import type { UsageCredit, UsageFetch, UsageSnapshot, UsageWindow } from '../types'
 
-// The pane session-rail opens; this mod adds its card to it, and opens it
-// too: a pane id is one pane whichever plugin opens it.
+// The pane session-rail opens; this mod adds its card to it. A Pane hook hears
+// its own plugin's panes unless its matcher names whose, so the card's hears
+// every plugin's (`plugin: '*'`) for this pane id.
 const RAIL = 'session-rail'
-const RAIL_TITLE = '세션'
 // The endpoint the Usage screen reads, called with the session's own
 // credential through $.session.authorize; never more than once a minute.
 const USAGE_PATH = '/api/oauth/usage'
@@ -313,15 +313,15 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'usage-rail' }, async $ => {
+  // The pane is session-rail's: its hook on this command opens it (a pane
+  // another plugin holds refuses this plugin's open). Running the hooks
+  // beneath first lets it whichever of the two comes first.
+  on('command.run', { command: 'usage-rail' }, async ($, e, next) => {
+    await next(e).catch(() => undefined)
     await refresh($, undefined, true).catch(() => undefined)
-    const opened = await $.ui.open({ id: RAIL, title: RAIL_TITLE })
+    const rail = await $.state.get({ plugin: 'session-rail', key: 'isOpen' })
 
-    return {
-      text: opened.isPlaced
-        ? '사용량 패널을 열었습니다.'
-        : `사용량 패널을 열지 못했습니다: ${opened.reason}`,
-    }
+    return { text: rail.value === false ? '사용량 패널을 열지 못했습니다.' : '사용량 패널을 열었습니다.' }
   })
 
   // After each turn, on each prompt and whenever the pane opens: read again,
@@ -346,7 +346,7 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => next(e))
 
   // The card goes above whatever the other mods add, so it leads the pane.
-  on('ui.render', { component: 'Pane', requestId: RAIL }, async ($, e, next) => {
+  on('ui.render', { component: 'Pane', requestId: RAIL, plugin: '*' }, async ($, e, next) => {
     const table = $.ui.resolve(e)
     const { Box, Text } = table
     // The terminal's table names an Svg it draws as nothing; it gets cells.
