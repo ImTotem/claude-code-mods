@@ -92,6 +92,23 @@ test('the footer button sits beside the mode labels and opens and closes the pan
   expect(seen.isUp).toBe(true)
 })
 
+test('an app-hosted session opens the pane at its start, drawn once the app attaches', async ($, on) => {
+  const seen = surface(on, 'no surface attached')
+  on('session.attach', ($, e) => ({ clientId: e.clientId }))
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: false })
+  expect(seen.opens).toBe(1)
+
+  // The app attaches and the engine draws the pane it holds open.
+  seen.isUp = true
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+
+  // So the footer button reads open: its press closes the pane.
+  const footer = await $.ui.mount({ ...FOOTER, surface: 'desktop' })
+  expect((await footer.find({ type: 'Button', key: 'toggle-rail' }))?.props.dimColor).toBe(false)
+  await footer.press({ key: 'toggle-rail' })
+  expect(seen.isUp).toBe(false)
+})
+
 test("the person's prompt opens the pane, once", async ($, on) => {
   const seen = surface(on)
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
