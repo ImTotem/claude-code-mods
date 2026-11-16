@@ -187,16 +187,48 @@ test("the card leads the pane and keeps the other mods' cards below it", {
   expect(shown).toEqual(['사용량', 'other card'])
 })
 
-test('the command opens the session pane', async ($, on) => {
+// session-rail as it answers this mod's command: it opens its pane, which
+// refuses an open of this mod's own, and keeps whether a surface draws it.
+const RAIL_OPENS = {
+  name: 'session-rail',
+  register(on: On) {
+    on('command.run', { command: 'usage-rail' }, async ($, e, next) => {
+      const opened = await $.ui.open({ id: 'session-rail', title: '세션' })
+      await $.state.set({ plugin: 'session-rail', key: 'isOpen' }, opened.isPlaced)
+      return next(e)
+    })
+  },
+}
+
+const RAIL_UNPLACED = {
+  name: 'session-rail',
+  register(on: On) {
+    on('command.run', { command: 'usage-rail' }, async ($, e, next) => {
+      await $.state.set({ plugin: 'session-rail', key: 'isOpen' }, false)
+      return next(e)
+    })
+  },
+}
+
+const RUN = {
+  command: 'usage-rail',
+  args: '',
+  origin: { kind: 'composer' },
+  presentation: { isFullscreen: false, columns: 80 },
+} as const
+
+test('the command has session-rail open its pane, and reads again', { plugins: [RAIL_OPENS] }, async ($, on) => {
   const seen = engine(on)
-  const ran = await $.command.run({
-    command: 'usage-rail',
-    args: '',
-    origin: { kind: 'composer' },
-    presentation: { isFullscreen: false, columns: 80 },
-  })
-  expect(ran).toMatchObject({ text: '사용량 패널을 열었습니다.' })
+  expect(await $.command.run(RUN)).toMatchObject({ text: '사용량 패널을 열었습니다.' })
+  // Opened by session-rail alone: this mod opens nothing of its own.
   expect(seen.opens).toEqual(['session-rail'])
+  expect(seen.urls).toHaveLength(1)
+})
+
+test('the command says when session-rail could not draw its pane', { plugins: [RAIL_UNPLACED] }, async ($, on) => {
+  const seen = engine(on)
+  expect(await $.command.run(RUN)).toMatchObject({ text: '사용량 패널을 열지 못했습니다.' })
+  expect(seen.opens).toEqual([])
 })
 
 test('a read that never answers ends as a failure after 15 seconds', async ($, on) => {
