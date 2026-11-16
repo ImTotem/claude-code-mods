@@ -26,15 +26,16 @@ const PROMPT = { text: '작업해줘', wait: false, origin: { kind: 'composer' }
 // A surface stand-in: it places the pane once the open is asked for (a press,
 // a prompt), or never when `refuses` names why; and draws nothing of its own.
 function surface(on: On, refuses?: string) {
-  const seen = { opens: 0, isUp: false, toasts: [] as string[] }
+  const seen = { opens: 0, isUp: false, toasts: [] as string[], placements: [] as (string | undefined)[] }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('ui.panes', () => ({
     value: seen.isUp ? [{ id: 'session-rail', title: '세션', isShown: true, isFocused: false, isPlaced: true }] : [],
   }))
-  on('ui.open', () => {
+  on('ui.open', ($, e) => {
     seen.opens += 1
+    seen.placements.push(e.placement)
     // The first open is session.start's, unasked, on a narrow surface.
     if (refuses !== undefined || seen.opens === 1) {
       return { value: { isPlaced: false, reason: refuses ?? 'unasked below 144 columns' } }
@@ -138,6 +139,8 @@ test('the command opens the pane and says so', async ($, on) => {
   })
   expect(ran).toMatchObject({ text: '세션 패널을 열었습니다.' })
   expect(seen.isUp).toBe(true)
+  // Each open asks for the desktop app's widget, its seat in the session rail.
+  expect(seen.placements).toEqual(['widget', 'widget'])
 })
 
 test("the pane stacks the other mods' cards", {
