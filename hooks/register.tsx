@@ -14,8 +14,11 @@ const isOpen = atom({ plugin: 'session-rail', key: 'isOpen' } as const, false)
 const isDismissed = atom({ plugin: 'session-rail', key: 'isDismissed' } as const, false)
 const isWarned = atom({ plugin: 'session-rail', key: 'isWarned' } as const, false)
 
+// Asked as the desktop app's widget, the pane's small form, which the app may
+// seat in its session rail (the column beside the chat) or a corner of the
+// chat; the person expands it to the full pane. Elsewhere it opens as before.
 async function open($: EngineInterface) {
-  const opened = await $.ui.open({ id: PANE, title: TITLE })
+  const opened = await $.ui.open({ id: PANE, title: TITLE, placement: 'widget' })
   await update($, isOpen, () => opened.isPlaced)
 
   return opened
@@ -138,7 +141,7 @@ export const register: Register = on => {
     const cards = await next(e)
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={e.props.placement === 'widget' ? 'sm' : 1}>
         {cards}
       </Box>
     )
